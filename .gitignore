@@ -1,0 +1,13 @@
+# Binary
+icloud
+
+# Debug files
+debug_*.go
+test_*.py
+
+# IDE
+.idea/
+.vscode/
+
+# Local config
+.claude/
