@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/arkan/icloud-cli/internal/api"
 	"github.com/arkan/icloud-cli/internal/config"
+	"github.com/arkan/icloud-cli/internal/srp"
 )
 
 // Authenticator handles iCloud authentication flow
@@ -21,12 +23,30 @@ func NewAuthenticator(client *api.Client) *Authenticator {
 	return &Authenticator{client: client}
 }
 
-// SignInRequest is the request body for signing in
-type SignInRequest struct {
-	AccountName   string   `json:"accountName"`
-	Password      string   `json:"password"`
-	RememberMe    bool     `json:"rememberMe"`
-	TrustTokens   []string `json:"trustTokens"`
+// SRPInitRequest is the request body for SRP init
+type SRPInitRequest struct {
+	AccountName string   `json:"accountName"`
+	A           string   `json:"a"`
+	Protocols   []string `json:"protocols"`
+}
+
+// SRPInitResponse is the response from SRP init
+type SRPInitResponse struct {
+	Salt      string `json:"salt"`
+	B         string `json:"b"`
+	C         string `json:"c"`
+	Iteration int    `json:"iteration"`
+	Protocol  string `json:"protocol"`
+}
+
+// SRPCompleteRequest is the request body for SRP complete
+type SRPCompleteRequest struct {
+	AccountName string   `json:"accountName"`
+	C           string   `json:"c"`
+	M1          string   `json:"m1"`
+	M2          string   `json:"m2"`
+	RememberMe  bool     `json:"rememberMe"`
+	TrustTokens []string `json:"trustTokens"`
 }
 
 // AccountLoginRequest is the request body for account login
@@ -40,7 +60,8 @@ type AccountLoginRequest struct {
 // AccountLoginResponse contains the response from account login
 type AccountLoginResponse struct {
 	DsInfo struct {
-		HsaVersion int  `json:"hsaVersion"`
+		HsaVersion int    `json:"hsaVersion"`
+		Dsid       string `json:"dsid"`
 	} `json:"dsInfo"`
 	HsaChallengeRequired bool `json:"hsaChallengeRequired"`
 	HsaTrustedBrowser    bool `json:"hsaTrustedBrowser"`
@@ -57,7 +78,7 @@ type SecurityCodeRequest struct {
 	} `json:"securityCode"`
 }
 
-// SignIn performs initial authentication
+// SignIn performs initial authentication using SRP
 func (a *Authenticator) SignIn(appleID, password string) error {
 	// Initialize session with new client ID
 	session := a.client.Session()
@@ -70,32 +91,95 @@ func (a *Authenticator) SignIn(appleID, password string) error {
 	}
 	session.AppleID = appleID
 
-	// Build request
-	req := SignInRequest{
+	// Create SRP password handler
+	srpPassword := srp.NewApplePassword(password)
+
+	// Create SRP client
+	srpClient, err := srp.NewClient(appleID, srpPassword)
+	if err != nil {
+		return fmt.Errorf("create SRP client: %w", err)
+	}
+
+	// Step 1: SRP Init
+	initReq := SRPInitRequest{
 		AccountName: appleID,
-		Password:    password,
+		A:           srpClient.GetPublicKey(),
+		Protocols:   []string{"s2k", "s2k_fo"},
+	}
+
+	headers := a.client.AuthHeaders()
+	url := api.AuthEndpoint + "/signin/init"
+
+	resp, body, err := a.client.Request("POST", url, initReq, headers)
+	if err != nil {
+		return fmt.Errorf("SRP init request: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("SRP init failed: %s - %s", resp.Status, string(body))
+	}
+
+	var initResp SRPInitResponse
+	if err := json.Unmarshal(body, &initResp); err != nil {
+		return fmt.Errorf("parse SRP init response: %w", err)
+	}
+
+	// Step 2: Configure password with server parameters
+	salt, err := decodeBase64(initResp.Salt)
+	if err != nil {
+		return fmt.Errorf("decode salt: %w", err)
+	}
+	srpPassword.SetEncryptInfo(initResp.Protocol, salt, initResp.Iteration)
+
+	// Step 3: Process challenge and get M1, M2
+	m1, m2, err := srpClient.ProcessChallenge(initResp.Salt, initResp.B)
+	if err != nil {
+		return fmt.Errorf("process SRP challenge: %w", err)
+	}
+
+	// Step 4: SRP Complete
+	completeReq := SRPCompleteRequest{
+		AccountName: appleID,
+		C:           initResp.C,
+		M1:          m1,
+		M2:          m2,
 		RememberMe:  true,
 		TrustTokens: []string{},
 	}
 	if session.TrustToken != "" {
-		req.TrustTokens = []string{session.TrustToken}
+		completeReq.TrustTokens = []string{session.TrustToken}
 	}
 
-	url := api.AuthEndpoint + "/signin?isRememberMeEnabled=true"
-	headers := a.client.AuthHeaders()
-
-	resp, body, err := a.client.Request("POST", url, req, headers)
+	url = api.AuthEndpoint + "/signin/complete?isRememberMeEnabled=true"
+	resp, body, err = a.client.Request("POST", url, completeReq, headers)
 	if err != nil {
-		return fmt.Errorf("sign in request: %w", err)
+		return fmt.Errorf("SRP complete request: %w", err)
 	}
 
 	if resp.StatusCode == 409 {
-		// 2FA required - this is expected
+		// 2FA required - fetch auth state to trigger code sending
+		if err := a.fetchAuthState(); err != nil {
+			return fmt.Errorf("fetch auth state: %w", err)
+		}
+		// Return special error to indicate 2FA is needed
+		return fmt.Errorf("2FA required")
+	}
+
+	if resp.StatusCode == 412 {
+		// Non-2FA account, call repair endpoint
+		url = api.AuthEndpoint + "/repair/complete"
+		resp, body, err = a.client.Request("POST", url, map[string]interface{}{}, headers)
+		if err != nil {
+			return fmt.Errorf("repair complete request: %w", err)
+		}
+		if resp.StatusCode != 200 && resp.StatusCode != 204 {
+			return fmt.Errorf("repair complete failed: %s - %s", resp.Status, string(body))
+		}
 		return a.authenticateWithToken()
 	}
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("sign in failed: %s - %s", resp.Status, string(body))
+		return fmt.Errorf("SRP complete failed: %s - %s", resp.Status, string(body))
 	}
 
 	return a.authenticateWithToken()
@@ -130,6 +214,11 @@ func (a *Authenticator) authenticateWithToken() error {
 		return fmt.Errorf("parse login response: %w", err)
 	}
 
+	// Extract dsid
+	if loginResp.DsInfo.Dsid != "" {
+		session.Dsid = loginResp.DsInfo.Dsid
+	}
+
 	// Extract webservice URLs
 	session.Webservices = make(map[string]string)
 	for name, svc := range loginResp.Webservices {
@@ -143,8 +232,21 @@ func (a *Authenticator) authenticateWithToken() error {
 
 // Validate checks if the current session is still valid
 func (a *Authenticator) Validate() (*AccountLoginResponse, error) {
-	url := api.SetupEndpoint + "/validate"
-	resp, body, err := a.client.Request("POST", url, nil, nil)
+	session := a.client.Session()
+	if session == nil || session.SessionToken == "" {
+		return nil, fmt.Errorf("no session token")
+	}
+
+	// Use accountLogin with stored token to validate and refresh session
+	req := AccountLoginRequest{
+		AccountCountryCode: session.AccountCountry,
+		DsWebAuthToken:     session.SessionToken,
+		ExtendedLogin:      true,
+		TrustToken:         session.TrustToken,
+	}
+
+	url := api.SetupEndpoint + "/accountLogin"
+	resp, body, err := a.client.Request("POST", url, req, nil)
 	if err != nil {
 		return nil, fmt.Errorf("validate request: %w", err)
 	}
@@ -158,12 +260,12 @@ func (a *Authenticator) Validate() (*AccountLoginResponse, error) {
 		return nil, fmt.Errorf("parse validate response: %w", err)
 	}
 
-	// Update webservices
-	session := a.client.Session()
-	if session == nil {
-		session = &config.Session{}
-		a.client.SetSession(session)
+	// Update dsid
+	if loginResp.DsInfo.Dsid != "" {
+		session.Dsid = loginResp.DsInfo.Dsid
 	}
+
+	// Update webservices
 	session.Webservices = make(map[string]string)
 	for name, svc := range loginResp.Webservices {
 		if svc.URL != "" {
@@ -177,7 +279,7 @@ func (a *Authenticator) Validate() (*AccountLoginResponse, error) {
 
 // Requires2FA checks if 2FA is required
 func (a *Authenticator) Requires2FA(loginResp *AccountLoginResponse) bool {
-	return loginResp.DsInfo.HsaVersion >= 1 && 
+	return loginResp.DsInfo.HsaVersion >= 1 &&
 		(loginResp.HsaChallengeRequired || !loginResp.HsaTrustedBrowser)
 }
 
@@ -219,4 +321,50 @@ func (a *Authenticator) TrustSession() error {
 
 	// Complete authentication
 	return a.authenticateWithToken()
+}
+
+// fetchAuthState retrieves the current auth state (triggers 2FA code sending)
+func (a *Authenticator) fetchAuthState() error {
+	url := api.AuthEndpoint
+	headers := a.client.AuthHeaders()
+
+	resp, _, err := a.client.Request("GET", url, nil, headers)
+	if err != nil {
+		return fmt.Errorf("fetch auth state: %w", err)
+	}
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		return fmt.Errorf("fetch auth state failed: %s", resp.Status)
+	}
+
+	return nil
+}
+
+// RequestCode explicitly requests a 2FA code to be sent to trusted devices
+func (a *Authenticator) RequestCode() error {
+	// First try to get auth state which should trigger code push
+	if err := a.fetchAuthState(); err != nil {
+		return err
+	}
+
+	// Request code resend if needed
+	url := api.AuthEndpoint + "/verify/trusteddevice"
+	headers := a.client.AuthHeaders()
+
+	resp, _, err := a.client.Request("PUT", url, nil, headers)
+	if err != nil {
+		return fmt.Errorf("request code: %w", err)
+	}
+
+	// 200 or 202 means code was sent
+	if resp.StatusCode != 200 && resp.StatusCode != 202 {
+		return fmt.Errorf("request code failed: %s", resp.Status)
+	}
+
+	return nil
+}
+
+// decodeBase64 decodes a base64 string
+func decodeBase64(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
 }

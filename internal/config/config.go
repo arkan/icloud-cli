@@ -22,6 +22,7 @@ type Session struct {
 	Scnt           string            `json:"scnt,omitempty"`
 	AccountCountry string            `json:"account_country,omitempty"`
 	AppleID        string            `json:"apple_id,omitempty"`
+	Dsid           string            `json:"dsid,omitempty"`
 	Webservices    map[string]string `json:"webservices,omitempty"`
 	Cookies        map[string]string `json:"cookies,omitempty"`
 }

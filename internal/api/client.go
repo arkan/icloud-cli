@@ -8,15 +8,20 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/arkan/icloud-cli/internal/config"
 )
 
+var debug = os.Getenv("ICLOUD_DEBUG") == "1"
+
 const (
-	AuthEndpoint  = "https://idmsa.apple.com/appleauth/auth"
-	HomeEndpoint  = "https://www.icloud.com"
-	SetupEndpoint = "https://setup.icloud.com/setup/ws/1"
+	AuthEndpoint     = "https://idmsa.apple.com/appleauth/auth"
+	AuthRootEndpoint = "https://idmsa.apple.com"
+	HomeEndpoint     = "https://www.icloud.com"
+	SetupEndpoint    = "https://setup.icloud.com/setup/ws/1"
 
 	WidgetKey = "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d"
 )
@@ -30,10 +35,17 @@ type Client struct {
 // NewClient creates a new API client
 func NewClient(session *config.Session) *Client {
 	jar, _ := cookiejar.New(nil)
+
+	// Use custom transport to disable HTTP/2 (can cause 421 errors)
+	transport := &http.Transport{
+		ForceAttemptHTTP2: false,
+	}
+
 	return &Client{
 		http: &http.Client{
-			Jar:     jar,
-			Timeout: 30 * time.Second,
+			Jar:       jar,
+			Timeout:   30 * time.Second,
+			Transport: transport,
 		},
 		session: session,
 	}
@@ -76,6 +88,13 @@ func (c *Client) Request(method, url string, body interface{}, headers map[strin
 		req.Header.Set(k, v)
 	}
 
+	if debug {
+		fmt.Fprintf(os.Stderr, "DEBUG: %s %s\n", method, url)
+		for k, v := range req.Header {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", k, v)
+		}
+	}
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("do request: %w", err)
@@ -112,18 +131,37 @@ func (c *Client) captureSessionHeaders(resp *http.Response) {
 			*target = val
 		}
 	}
+
+	// Capture cookies for webservice authentication
+	if c.session.Cookies == nil {
+		c.session.Cookies = make(map[string]string)
+	}
+	for _, cookie := range resp.Cookies() {
+		// Store important Apple auth cookies
+		if strings.HasPrefix(cookie.Name, "X-APPLE-") ||
+			cookie.Name == "aasp" ||
+			strings.HasPrefix(cookie.Name, "DES") {
+			c.session.Cookies[cookie.Name] = cookie.Value
+		}
+	}
 }
 
 // AuthHeaders returns headers required for authentication requests
 func (c *Client) AuthHeaders() map[string]string {
 	headers := map[string]string{
-		"X-Apple-OAuth-Client-Id":          WidgetKey,
-		"X-Apple-OAuth-Client-Type":        "firstPartyAuth",
-		"X-Apple-OAuth-Redirect-URI":       HomeEndpoint,
-		"X-Apple-OAuth-Require-Grant-Code": "true",
-		"X-Apple-OAuth-Response-Mode":      "web_message",
-		"X-Apple-OAuth-Response-Type":      "code",
-		"X-Apple-Widget-Key":               WidgetKey,
+		"Accept":                            "application/json, text/javascript",
+		"Content-Type":                      "application/json",
+		"User-Agent":                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"X-Apple-OAuth-Client-Id":           WidgetKey,
+		"X-Apple-OAuth-Client-Type":         "firstPartyAuth",
+		"X-Apple-OAuth-Redirect-URI":        HomeEndpoint,
+		"X-Apple-OAuth-Require-Grant-Code":  "true",
+		"X-Apple-OAuth-Response-Mode":       "web_message",
+		"X-Apple-OAuth-Response-Type":       "code",
+		"X-Apple-Widget-Key":                WidgetKey,
+		// Auth requests must use idmsa.apple.com as origin
+		"Origin":  AuthRootEndpoint,
+		"Referer": AuthRootEndpoint + "/",
 	}
 
 	if c.session != nil {
@@ -152,5 +190,45 @@ func (c *Client) GetWebserviceURL(service string) (string, error) {
 		return "", fmt.Errorf("service %q not available", service)
 	}
 
+	// Remove explicit :443 port as it can cause 421 Misdirected Request
+	url = strings.TrimSuffix(url, ":443")
+
 	return url, nil
+}
+
+// WebserviceParams returns common query parameters for webservice requests
+func (c *Client) WebserviceParams() string {
+	params := "clientBuildNumber=2552Build21&clientMasteringNumber=2552Build21"
+	if c.session != nil {
+		if c.session.ClientID != "" {
+			params += "&clientId=" + c.session.ClientID
+		}
+		if c.session.Dsid != "" {
+			params += "&dsid=" + c.session.Dsid
+		}
+	}
+	return params
+}
+
+// WebserviceHeaders returns headers needed for webservice requests
+func (c *Client) WebserviceHeaders() map[string]string {
+	headers := map[string]string{
+		"Accept":       "application/json",
+		"Content-Type": "application/json",
+		"Origin":       HomeEndpoint,
+		"Referer":      HomeEndpoint + "/",
+	}
+
+	// Add cookies as Cookie header
+	if c.session != nil && c.session.Cookies != nil {
+		var cookieParts []string
+		for name, value := range c.session.Cookies {
+			cookieParts = append(cookieParts, name+"="+value)
+		}
+		if len(cookieParts) > 0 {
+			headers["Cookie"] = strings.Join(cookieParts, "; ")
+		}
+	}
+
+	return headers
 }
