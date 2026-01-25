@@ -12,13 +12,13 @@ A command-line interface for accessing iCloud data, starting with Reminders.
 ## Installation
 
 ```bash
-go install github.com/florian/icloud-cli/cmd@latest
+go install github.com/arkan/icloud-cli/cmd@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/florian/icloud-cli.git
+git clone https://github.com/arkan/icloud-cli.git
 cd icloud-cli
 go build -o icloud ./cmd/
 ```

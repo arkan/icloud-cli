@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/florian/icloud-cli/internal/api"
+	"github.com/arkan/icloud-cli/internal/api"
 )
 
 // Service provides access to Reminders

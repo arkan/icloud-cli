@@ -7,8 +7,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/florian/icloud-cli/internal/api"
-	"github.com/florian/icloud-cli/internal/config"
+	"github.com/arkan/icloud-cli/internal/api"
+	"github.com/arkan/icloud-cli/internal/config"
 )
 
 // Authenticator handles iCloud authentication flow

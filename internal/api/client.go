@@ -10,7 +10,7 @@ import (
 	"net/http/cookiejar"
 	"time"
 
-	"github.com/florian/icloud-cli/internal/config"
+	"github.com/arkan/icloud-cli/internal/config"
 )
 
 const (

@@ -1,4 +1,4 @@
-module github.com/florian/icloud-cli
+module github.com/arkan/icloud-cli
 
 go 1.21
 

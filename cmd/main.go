@@ -11,10 +11,10 @@ import (
 	"github.com/fatih/color"
 	"golang.org/x/term"
 
-	"github.com/florian/icloud-cli/internal/api"
-	"github.com/florian/icloud-cli/internal/auth"
-	"github.com/florian/icloud-cli/internal/config"
-	"github.com/florian/icloud-cli/internal/reminders"
+	"github.com/arkan/icloud-cli/internal/api"
+	"github.com/arkan/icloud-cli/internal/auth"
+	"github.com/arkan/icloud-cli/internal/config"
+	"github.com/arkan/icloud-cli/internal/reminders"
 )
 
 var version = "0.1.0"
