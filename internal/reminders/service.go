@@ -141,7 +141,64 @@ func (s *Service) GetLists() ([]Collection, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Check if reminders are "upgraded" to CloudKit
+	if s.isUpgraded(data) && s.cloudkitSvc != nil {
+		return s.getListsFromCloudKit(data.Collections)
+	}
+
 	return data.Collections, nil
+}
+
+// getListsFromCloudKit fetches lists via CloudKit, using legacy names as fallback
+func (s *Service) getListsFromCloudKit(legacyCollections []Collection) ([]Collection, error) {
+	// Get list IDs from CloudKit
+	ckLists, err := s.cloudkitSvc.GetLists()
+	if err != nil {
+		return nil, fmt.Errorf("cloudkit: %w", err)
+	}
+
+	// Build map of legacy collections by title for matching
+	legacyByTitle := make(map[string]Collection)
+	for _, c := range legacyCollections {
+		if c.Title != "" {
+			legacyByTitle[c.Title] = c
+		}
+	}
+
+	var result []Collection
+	usedLegacyTitles := make(map[string]bool)
+
+	for i, l := range ckLists {
+		title := l.Title
+
+		// Try to match with legacy collection by title
+		if title != "" && !strings.HasPrefix(title, "List ") {
+			usedLegacyTitles[title] = true
+		} else {
+			// CloudKit has no title, try to match by order/count
+			// If we have same number of lists, match by position
+			if i < len(legacyCollections) && legacyCollections[i].Title != "" {
+				candidate := legacyCollections[i].Title
+				if !usedLegacyTitles[candidate] {
+					title = candidate
+					usedLegacyTitles[candidate] = true
+				}
+			}
+		}
+
+		if title == "" || strings.HasPrefix(title, "List ") {
+			title = "List " + l.ID[:8]
+		}
+
+		result = append(result, Collection{
+			GUID:  l.ID,
+			Title: title,
+			Order: i,
+		})
+	}
+
+	return result, nil
 }
 
 // GetReminders returns all reminders for a specific list

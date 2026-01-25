@@ -163,3 +163,30 @@ func (c *Client) FetchChanges(container, env, database string, zoneID ZoneID, sy
 
 	return &resp, nil
 }
+
+// LookupRecords fetches specific records by their record names
+func (c *Client) LookupRecords(container, env, database string, zoneID ZoneID, recordNames []string) (*RecordsResponse, error) {
+	path := c.buildPath(container, env, database, "records/lookup")
+
+	var refs []RecordRef
+	for _, name := range recordNames {
+		refs = append(refs, RecordRef{RecordName: name})
+	}
+
+	req := LookupRequest{
+		Records: refs,
+		ZoneID:  zoneID,
+	}
+
+	body, err := c.request("POST", path, req)
+	if err != nil {
+		return nil, fmt.Errorf("lookup records: %w", err)
+	}
+
+	var result RecordsResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse lookup response: %w", err)
+	}
+
+	return &result, nil
+}

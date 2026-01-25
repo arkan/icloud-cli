@@ -116,7 +116,7 @@ func (s *RemindersService) GetLists() ([]ReminderList, error) {
 		syncToken = resp.SyncToken
 	}
 
-	// Find unique lists from Reminder records
+	// Find unique list IDs from Reminder records
 	listIDs := make(map[string]bool)
 	for _, r := range allRecords {
 		if r.RecordType == "Reminder" && r.Parent != nil {
@@ -124,31 +124,44 @@ func (s *RemindersService) GetLists() ([]ReminderList, error) {
 		}
 	}
 
-	// Look up list records to get their titles
+	// Collect list record names for lookup
+	var listRecordNames []string
+	for listID := range listIDs {
+		listRecordNames = append(listRecordNames, listID)
+	}
+
+	// Lookup list records to get their titles
+	listRecords := make(map[string]Record)
+	if len(listRecordNames) > 0 {
+		resp, err := s.client.LookupRecords(
+			RemindersContainer, RemindersEnv, RemindersDB,
+			s.zoneID, listRecordNames,
+		)
+		if err == nil {
+			for _, r := range resp.Records {
+				listRecords[r.RecordName] = r
+			}
+		}
+	}
+
+	// Build list results
 	var lists []ReminderList
 	for listID := range listIDs {
-		// Extract list name from the record name (format: "List/UUID")
 		parts := strings.Split(listID, "/")
 		uuid := listID
 		if len(parts) == 2 {
 			uuid = parts[1]
 		}
 
-		// Try to find list info in the records (they may be included)
-		found := false
-		for _, r := range allRecords {
-			if r.RecordName == listID && r.RecordType == "List" {
-				title := s.decodeTitle(r)
-				lists = append(lists, ReminderList{ID: uuid, Title: title})
-				found = true
-				break
-			}
+		title := ""
+		if r, ok := listRecords[listID]; ok {
+			title = s.decodeTitle(r)
+		}
+		if title == "" {
+			title = "List " + uuid[:8]
 		}
 
-		if !found {
-			// List record not found, use a placeholder
-			lists = append(lists, ReminderList{ID: uuid, Title: "List " + uuid[:8]})
-		}
+		lists = append(lists, ReminderList{ID: uuid, Title: title})
 	}
 
 	return lists, nil
