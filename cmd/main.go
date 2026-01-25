@@ -40,7 +40,8 @@ func (c *VersionCmd) Run() error {
 
 // LoginCmd handles authentication
 type LoginCmd struct {
-	AppleID string `arg:"" optional:"" help:"Apple ID (email)"`
+	AppleID  string `arg:"" optional:"" help:"Apple ID (email)"`
+	Password string `short:"p" help:"Password (for debugging, prefer interactive input)"`
 }
 
 func (c *LoginCmd) Run() error {
@@ -50,13 +51,18 @@ func (c *LoginCmd) Run() error {
 		fmt.Scanln(&appleID)
 	}
 
-	fmt.Print("Password: ")
-	passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Println()
-	if err != nil {
-		return fmt.Errorf("read password: %w", err)
+	var password string
+	if c.Password != "" {
+		password = c.Password
+	} else {
+		fmt.Print("Password: ")
+		passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
+		fmt.Println()
+		if err != nil {
+			return fmt.Errorf("read password: %w", err)
+		}
+		password = string(passwordBytes)
 	}
-	password := string(passwordBytes)
 
 	// Load existing session or create new
 	session, _ := config.LoadSession()
@@ -70,7 +76,12 @@ func (c *LoginCmd) Run() error {
 	color.Yellow("→ Signing in to iCloud...")
 	if err := authenticator.SignIn(appleID, password); err != nil {
 		// Check if 2FA is needed
-		if strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "no session token") {
+		if strings.Contains(err.Error(), "2FA required") {
+			// Request code to be sent
+			color.Yellow("→ Requesting verification code...")
+			if reqErr := authenticator.RequestCode(); reqErr != nil {
+				color.Yellow("  (code request: %v)", reqErr)
+			}
 			return handle2FA(authenticator)
 		}
 		return fmt.Errorf("sign in failed: %w", err)
@@ -132,12 +143,10 @@ func (c *StatusCmd) Run() error {
 		return nil
 	}
 
-	client := api.NewClient(session)
-	authenticator := auth.NewAuthenticator(client)
-
-	_, err = authenticator.Validate()
-	if err != nil {
-		color.Red("✗ Session expired")
+	// Just check if we have valid session data without calling accountLogin
+	// This avoids triggering Apple's "sign in" notification emails
+	if len(session.Webservices) == 0 {
+		color.Red("✗ Session incomplete - run 'icloud login' to refresh")
 		return nil
 	}
 
@@ -450,15 +459,13 @@ func getRemindersService() (*reminders.Service, error) {
 		return nil, fmt.Errorf("not logged in - run 'icloud login' first")
 	}
 
-	client := api.NewClient(session)
-	authenticator := auth.NewAuthenticator(client)
-
-	// Validate and refresh session
-	_, err = authenticator.Validate()
-	if err != nil {
-		return nil, fmt.Errorf("session expired - run 'icloud login' to refresh")
+	// Check if session has required data without calling accountLogin
+	// This avoids triggering Apple's "sign in" notification emails
+	if len(session.Webservices) == 0 {
+		return nil, fmt.Errorf("session incomplete - run 'icloud login' to refresh")
 	}
 
+	client := api.NewClient(session)
 	return reminders.NewService(client)
 }
 
