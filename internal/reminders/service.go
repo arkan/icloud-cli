@@ -4,16 +4,20 @@ package reminders
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/arkan/icloud-cli/internal/api"
+	"github.com/arkan/icloud-cli/internal/cloudkit"
 )
 
 // Service provides access to Reminders
 type Service struct {
-	client     *api.Client
-	serviceURL string
-	timezone   string
+	client      *api.Client
+	serviceURL  string
+	timezone    string
+	cloudkitSvc *cloudkit.RemindersService
+	useCloudKit bool
 }
 
 // Collection represents a reminders list
@@ -90,11 +94,19 @@ func NewService(client *api.Client) (*Service, error) {
 		return nil, err
 	}
 
-	return &Service{
+	svc := &Service{
 		client:     client,
 		serviceURL: url,
 		timezone:   "Europe/Paris",
-	}, nil
+	}
+
+	// Try to initialize CloudKit service
+	ckClient, err := cloudkit.NewClient(client)
+	if err == nil {
+		svc.cloudkitSvc = cloudkit.NewRemindersService(ckClient)
+	}
+
+	return svc, nil
 }
 
 // SetTimezone sets the timezone for date operations
@@ -139,6 +151,63 @@ func (s *Service) GetReminders(listGUID string) ([]ParsedReminder, error) {
 		return nil, err
 	}
 
+	// Check if reminders are "upgraded" to CloudKit
+	if s.isUpgraded(data) && s.cloudkitSvc != nil {
+		return s.getRemindersFromCloudKit(listGUID)
+	}
+
+	// Use legacy API
+	return s.getRemindersFromLegacy(data, listGUID)
+}
+
+// isUpgraded checks if reminders have been upgraded to CloudKit
+func (s *Service) isUpgraded(data *StartupResponse) bool {
+	for _, r := range data.Reminders {
+		if strings.Contains(r.Title, "upgraded these reminders") ||
+			strings.Contains(r.Title, "Where are my reminders") {
+			return true
+		}
+	}
+	return false
+}
+
+// getRemindersFromCloudKit fetches reminders via CloudKit
+func (s *Service) getRemindersFromCloudKit(listGUID string) ([]ParsedReminder, error) {
+	items, err := s.cloudkitSvc.GetReminders(false) // exclude completed
+	if err != nil {
+		return nil, fmt.Errorf("cloudkit: %w", err)
+	}
+
+	var result []ParsedReminder
+	for _, item := range items {
+		// Filter by list if specified
+		if listGUID != "" && item.ListID != listGUID {
+			continue
+		}
+
+		// Extract UUID from record name (format: "Reminder/UUID")
+		guid := item.ID
+		if parts := strings.Split(item.ID, "/"); len(parts) == 2 {
+			guid = parts[1]
+		}
+
+		parsed := ParsedReminder{
+			GUID:        guid,
+			ListGUID:    item.ListID,
+			Title:       item.Title,
+			Description: item.Notes,
+			Completed:   item.Completed,
+			Priority:    item.Priority,
+			DueDate:     item.DueDate,
+		}
+		result = append(result, parsed)
+	}
+
+	return result, nil
+}
+
+// getRemindersFromLegacy fetches reminders via legacy API
+func (s *Service) getRemindersFromLegacy(data *StartupResponse, listGUID string) ([]ParsedReminder, error) {
 	// Build list name map
 	listNames := make(map[string]string)
 	for _, c := range data.Collections {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/arkan/icloud-cli/internal/api"
 	"github.com/arkan/icloud-cli/internal/auth"
+	"github.com/arkan/icloud-cli/internal/cloudkit"
 	"github.com/arkan/icloud-cli/internal/config"
 	"github.com/arkan/icloud-cli/internal/reminders"
 )
@@ -28,6 +30,9 @@ type CLI struct {
 
 	// Reminders commands
 	Reminders RemindersCmd `cmd:"" aliases:"r" help:"Manage reminders"`
+
+	// CloudKit debug commands
+	Cloudkit CloudkitCmd `cmd:"" aliases:"ck" help:"CloudKit debug commands"`
 }
 
 // VersionCmd shows the version
@@ -446,6 +451,293 @@ func (c *RmCmd) Run() error {
 
 	color.Green("✓ Deleted")
 	return nil
+}
+
+// CloudkitCmd is the parent command for CloudKit debug operations
+type CloudkitCmd struct {
+	Zones     CKZonesCmd     `cmd:"" help:"List CloudKit zones"`
+	Records   CKRecordsCmd   `cmd:"" help:"Query CloudKit records"`
+	Dump      CKDumpCmd      `cmd:"" help:"Dump all records from a zone"`
+	Reminders CKRemindersCmd `cmd:"" aliases:"r" help:"List reminders via CloudKit"`
+}
+
+// CKZonesCmd lists CloudKit zones
+type CKZonesCmd struct {
+	Container string `short:"c" default:"com.apple.reminders" help:"Container ID"`
+	Env       string `short:"e" default:"production" help:"Environment (production/development)"`
+	Database  string `short:"d" default:"private" help:"Database (private/public/shared)"`
+}
+
+func (c *CKZonesCmd) Run() error {
+	ckClient, err := getCloudKitClient()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Listing zones for %s/%s/%s...\n\n", c.Container, c.Env, c.Database)
+
+	zones, err := ckClient.ListZones(c.Container, c.Env, c.Database)
+	if err != nil {
+		return fmt.Errorf("list zones: %w", err)
+	}
+
+	if len(zones.Zones) == 0 {
+		fmt.Println("No zones found")
+		return nil
+	}
+
+	for _, z := range zones.Zones {
+		fmt.Printf("  📁 %s\n", color.CyanString(z.ZoneID.ZoneName))
+		if z.ZoneID.OwnerRecordName != "" {
+			fmt.Printf("     Owner: %s\n", z.ZoneID.OwnerRecordName)
+		}
+		if z.SyncToken != "" {
+			fmt.Printf("     SyncToken: %s...\n", z.SyncToken[:min(20, len(z.SyncToken))])
+		}
+	}
+
+	return nil
+}
+
+// CKRecordsCmd queries CloudKit records
+type CKRecordsCmd struct {
+	Container  string `short:"c" default:"com.apple.reminders" help:"Container ID"`
+	Env        string `short:"e" default:"production" help:"Environment"`
+	Database   string `short:"d" default:"private" help:"Database"`
+	Zone       string `short:"z" default:"com.apple.coredata.cloudkit.zone" help:"Zone name"`
+	RecordType string `arg:"" optional:"" help:"Record type to query"`
+	Limit      int    `short:"l" default:"10" help:"Max records to return"`
+	Raw        bool   `short:"r" help:"Show raw JSON output"`
+}
+
+func (c *CKRecordsCmd) Run() error {
+	ckClient, err := getCloudKitClient()
+	if err != nil {
+		return err
+	}
+
+	zoneID := cloudkit.ZoneID{ZoneName: c.Zone}
+
+	// If no record type specified, try to discover them
+	if c.RecordType == "" {
+		fmt.Printf("Discovering record types in zone %s...\n\n", c.Zone)
+		types, err := ckClient.GetRecordTypes(c.Container, c.Env, c.Database, zoneID)
+		if err != nil {
+			return err
+		}
+		if len(types) == 0 {
+			fmt.Println("No record types found (try specifying one with -t)")
+		} else {
+			fmt.Println("Found record types:")
+			for _, t := range types {
+				fmt.Printf("  - %s\n", color.GreenString(t))
+			}
+		}
+		return nil
+	}
+
+	// Query specific record type
+	fmt.Printf("Querying %s records in %s/%s/%s zone=%s...\n\n",
+		c.RecordType, c.Container, c.Env, c.Database, c.Zone)
+
+	req := cloudkit.QueryRequest{
+		ZoneID: zoneID,
+		Query: cloudkit.Query{
+			RecordType: c.RecordType,
+		},
+		ResultsLimit: c.Limit,
+	}
+
+	resp, err := ckClient.QueryRecords(c.Container, c.Env, c.Database, req)
+	if err != nil {
+		return fmt.Errorf("query records: %w", err)
+	}
+
+	if len(resp.Records) == 0 {
+		fmt.Println("No records found")
+		return nil
+	}
+
+	fmt.Printf("Found %d records:\n\n", len(resp.Records))
+
+	if c.Raw {
+		raw, _ := json.MarshalIndent(resp.Records, "", "  ")
+		fmt.Println(string(raw))
+		return nil
+	}
+
+	for i, r := range resp.Records {
+		fmt.Printf("%d. %s (%s)\n", i+1, color.CyanString(r.RecordName[:min(16, len(r.RecordName))]), r.RecordType)
+		if len(r.Fields) > 0 {
+			for k, v := range r.Fields {
+				valStr := fmt.Sprintf("%v", v.Value)
+				if len(valStr) > 50 {
+					valStr = valStr[:50] + "..."
+				}
+				fmt.Printf("   %s: %s\n", color.HiBlackString(k), valStr)
+			}
+		}
+		fmt.Println()
+	}
+
+	if resp.ContinuationMarker != "" {
+		fmt.Println(color.YellowString("(more records available)"))
+	}
+
+	return nil
+}
+
+// CKDumpCmd dumps all records from a zone using changes API
+type CKDumpCmd struct {
+	Container string `short:"c" default:"com.apple.reminders" help:"Container ID"`
+	Env       string `short:"e" default:"production" help:"Environment"`
+	Database  string `short:"d" default:"private" help:"Database"`
+	Zone      string `short:"z" default:"Reminders" help:"Zone name"`
+	Raw       bool   `short:"r" help:"Show raw JSON output"`
+}
+
+func (c *CKDumpCmd) Run() error {
+	ckClient, err := getCloudKitClient()
+	if err != nil {
+		return err
+	}
+
+	zoneID := cloudkit.ZoneID{ZoneName: c.Zone}
+
+	fmt.Printf("Fetching all records from %s/%s/%s zone=%s...\n\n",
+		c.Container, c.Env, c.Database, c.Zone)
+
+	resp, err := ckClient.FetchChanges(c.Container, c.Env, c.Database, zoneID, "")
+	if err != nil {
+		return fmt.Errorf("fetch changes: %w", err)
+	}
+
+	if len(resp.Records) == 0 {
+		fmt.Println("No records found")
+		return nil
+	}
+
+	fmt.Printf("Found %d records:\n\n", len(resp.Records))
+
+	if c.Raw {
+		raw, _ := json.MarshalIndent(resp.Records, "", "  ")
+		fmt.Println(string(raw))
+		return nil
+	}
+
+	// Group by record type
+	byType := make(map[string][]cloudkit.Record)
+	for _, r := range resp.Records {
+		byType[r.RecordType] = append(byType[r.RecordType], r)
+	}
+
+	for recType, records := range byType {
+		fmt.Printf("=== %s (%d) ===\n", color.CyanString(recType), len(records))
+		for i, r := range records {
+			if i >= 5 {
+				fmt.Printf("  ... and %d more\n", len(records)-5)
+				break
+			}
+			name := r.RecordName
+			if len(name) > 20 {
+				name = name[:20] + "..."
+			}
+			fmt.Printf("  %s", name)
+
+			// Show a few key fields
+			if title, ok := r.Fields["CD_title"]; ok {
+				fmt.Printf(" - %v", title.Value)
+			}
+			if title, ok := r.Fields["title"]; ok {
+				fmt.Printf(" - %v", title.Value)
+			}
+			fmt.Println()
+		}
+		fmt.Println()
+	}
+
+	if resp.MoreComing {
+		fmt.Println(color.YellowString("(more records available - sync token saved)"))
+	}
+
+	return nil
+}
+
+// CKRemindersCmd lists reminders via CloudKit
+type CKRemindersCmd struct {
+	All bool `short:"a" help:"Include completed reminders"`
+}
+
+func (c *CKRemindersCmd) Run() error {
+	ckClient, err := getCloudKitClient()
+	if err != nil {
+		return err
+	}
+
+	svc := cloudkit.NewRemindersService(ckClient)
+
+	fmt.Println("Fetching reminders from CloudKit...")
+
+	reminders, err := svc.GetReminders(!c.All)
+	if err != nil {
+		return fmt.Errorf("get reminders: %w", err)
+	}
+
+	if len(reminders) == 0 {
+		fmt.Println("No reminders found")
+		return nil
+	}
+
+	fmt.Printf("\nFound %d reminders:\n\n", len(reminders))
+
+	for _, r := range reminders {
+		bullet := "○"
+		if r.Completed {
+			bullet = "✓"
+		}
+
+		title := r.Title
+		if title == "" {
+			title = "(no title)"
+		}
+
+		fmt.Printf("  %s %s\n", bullet, title)
+
+		if r.DueDate != nil {
+			fmt.Printf("    Due: %s\n", color.HiBlackString(r.DueDate.Format("2006-01-02 15:04")))
+		}
+
+		if r.Notes != "" {
+			notes := r.Notes
+			if len(notes) > 50 {
+				notes = notes[:50] + "..."
+			}
+			fmt.Printf("    %s\n", color.HiBlackString(notes))
+		}
+
+		fmt.Printf("    %s\n", color.HiBlackString("ID: "+r.ID[:min(20, len(r.ID))]))
+	}
+
+	return nil
+}
+
+// getCloudKitClient creates an authenticated CloudKit client
+func getCloudKitClient() (*cloudkit.Client, error) {
+	session, err := config.LoadSession()
+	if err != nil {
+		return nil, fmt.Errorf("load session: %w", err)
+	}
+
+	if session == nil || session.SessionToken == "" {
+		return nil, fmt.Errorf("not logged in - run 'icloud login' first")
+	}
+
+	if len(session.Webservices) == 0 {
+		return nil, fmt.Errorf("session incomplete - run 'icloud login' to refresh")
+	}
+
+	client := api.NewClient(session)
+	return cloudkit.NewClient(client)
 }
 
 // getRemindersService creates an authenticated reminders service
