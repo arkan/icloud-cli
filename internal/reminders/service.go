@@ -104,9 +104,9 @@ func (s *Service) SetTimezone(tz string) {
 
 // GetAll fetches all reminders and collections
 func (s *Service) GetAll() (*StartupResponse, error) {
-	url := s.serviceURL + "/rd/startup?clientVersion=4.0&lang=en-us&usertz=" + s.timezone
-	
-	resp, body, err := s.client.Request("GET", url, nil, nil)
+	url := s.serviceURL + "/rd/startup?clientVersion=4.0&lang=en-us&usertz=" + s.timezone + "&" + s.client.WebserviceParams()
+
+	resp, body, err := s.client.Request("GET", url, nil, s.client.WebserviceHeaders())
 	if err != nil {
 		return nil, fmt.Errorf("fetch reminders: %w", err)
 	}
@@ -196,9 +196,13 @@ func (s *Service) Add(title, description, listGUID string, dueDate *time.Time) e
 		})
 	}
 
-	// Default to "tasks" list
+	// Default to first available list
 	if listGUID == "" {
-		listGUID = "tasks"
+		if len(data.Collections) > 0 {
+			listGUID = data.Collections[0].GUID
+		} else {
+			return fmt.Errorf("no reminder lists available")
+		}
 	}
 
 	// Build due date array
@@ -232,9 +236,9 @@ func (s *Service) Add(title, description, listGUID string, dueDate *time.Time) e
 		ClientState: ClientState{Collections: collections},
 	}
 
-	url := s.serviceURL + "/rd/reminders/tasks?clientVersion=4.0&lang=en-us&usertz=" + s.timezone
-	
-	resp, body, err := s.client.Request("POST", url, req, nil)
+	url := s.serviceURL + "/rd/reminders/tasks?clientVersion=4.0&lang=en-us&usertz=" + s.timezone + "&" + s.client.WebserviceParams()
+
+	resp, body, err := s.client.Request("POST", url, req, s.client.WebserviceHeaders())
 	if err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
@@ -292,9 +296,9 @@ func (s *Service) Complete(reminderGUID string) error {
 		ClientState: ClientState{Collections: collections},
 	}
 
-	url := s.serviceURL + "/rd/reminders/tasks?clientVersion=4.0&lang=en-us&usertz=" + s.timezone
-	
-	resp, body, err := s.client.Request("POST", url, req, nil)
+	url := s.serviceURL + "/rd/reminders/tasks?clientVersion=4.0&lang=en-us&usertz=" + s.timezone + "&" + s.client.WebserviceParams()
+
+	resp, body, err := s.client.Request("POST", url, req, s.client.WebserviceHeaders())
 	if err != nil {
 		return fmt.Errorf("complete reminder: %w", err)
 	}
@@ -344,9 +348,9 @@ func (s *Service) Delete(reminderGUID string) error {
 		ClientState: ClientState{Collections: collections},
 	}
 
-	url := s.serviceURL + "/rd/reminders/tasks?clientVersion=4.0&lang=en-us&usertz=" + s.timezone
-	
-	resp, body, err := s.client.Request("POST", url, req, nil)
+	url := s.serviceURL + "/rd/reminders/tasks?clientVersion=4.0&lang=en-us&usertz=" + s.timezone + "&" + s.client.WebserviceParams()
+
+	resp, body, err := s.client.Request("POST", url, req, s.client.WebserviceHeaders())
 	if err != nil {
 		return fmt.Errorf("delete reminder: %w", err)
 	}
