@@ -306,6 +306,7 @@ type AddCmd struct {
 	List        string `short:"l" help:"List name or GUID"`
 	Description string `short:"d" help:"Description"`
 	Due         string `help:"Due date (e.g., 'tomorrow 14:00', '2024-01-20')"`
+	Priority    string `short:"p" help:"Priority: high, medium, low (default: none)"`
 }
 
 func (c *AddCmd) Run() error {
@@ -339,7 +340,18 @@ func (c *AddCmd) Run() error {
 		dueDate = &parsed
 	}
 
-	if err := svc.Add(c.Title, c.Description, listGUID, dueDate); err != nil {
+	// Parse priority
+	priority := 0
+	switch strings.ToLower(c.Priority) {
+	case "high", "h", "1":
+		priority = 1
+	case "medium", "med", "m", "5":
+		priority = 5
+	case "low", "l", "9":
+		priority = 9
+	}
+
+	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority); err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
 

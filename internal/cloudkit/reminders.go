@@ -8,6 +8,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -287,6 +289,44 @@ func decodeGzipBase64(s string) string {
 	return string(decompressed)
 }
 
+// encodeGzipBase64 encodes a string with gzip compression and base64
+func encodeGzipBase64(s string) (string, error) {
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write([]byte(s)); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+// encodeTitleDocument encodes a title into the protobuf format used by CloudKit
+// Format: \x12 + length (varint) + UTF-8 string
+func encodeTitleDocument(title string) (string, error) {
+	// Simple protobuf encoding: field 2, wire type 2 (length-delimited)
+	// Full format includes some header bytes that Apple uses
+	titleBytes := []byte(title)
+	length := len(titleBytes)
+
+	var data []byte
+	// Add a minimal header (observed from real data)
+	data = append(data, 0x0a, 0x00) // field 1, empty
+
+	// Field 2: the title
+	data = append(data, 0x12) // field 2, wire type 2
+	if length < 128 {
+		data = append(data, byte(length))
+	} else {
+		// Varint encoding for lengths >= 128
+		data = append(data, byte(length&0x7f|0x80), byte(length>>7))
+	}
+	data = append(data, titleBytes...)
+
+	return encodeGzipBase64(string(data))
+}
+
 // extractReadableText tries to extract readable text from protobuf-encoded data
 func extractReadableText(s string) string {
 	// The decoded content is a protobuf where field 2 contains the title
@@ -345,4 +385,246 @@ func extractReadableText(s string) string {
 	}
 
 	return strings.TrimSpace(result.String())
+}
+
+// AddReminder creates a new reminder in CloudKit
+func (s *RemindersService) AddReminder(title, notes, listID string, priority int, dueDate *time.Time) (*ReminderItem, error) {
+	// Generate new UUID for the reminder
+	reminderID := uuid.New().String()
+	recordName := "Reminder/" + reminderID
+
+	// Encode the title
+	titleDoc, err := encodeTitleDocument(title)
+	if err != nil {
+		return nil, fmt.Errorf("encode title: %w", err)
+	}
+
+	now := time.Now().UnixMilli()
+
+	// Build the record
+	fields := map[string]FieldValue{
+		"TitleDocument": {
+			Value: titleDoc,
+			Type:  "ENCRYPTED_BYTES",
+		},
+		"CreationDate": {
+			Value: now,
+			Type:  "TIMESTAMP",
+		},
+		"LastModifiedDate": {
+			Value: now,
+			Type:  "TIMESTAMP",
+		},
+		"Priority": {
+			Value: priority,
+			Type:  "NUMBER_INT64",
+		},
+		"Completed": {
+			Value: 0,
+			Type:  "NUMBER_INT64",
+		},
+	}
+
+	// Add due date if provided
+	if dueDate != nil {
+		fields["DueDate"] = FieldValue{
+			Value: dueDate.UnixMilli(),
+			Type:  "TIMESTAMP",
+		}
+	}
+
+	// Add notes if provided
+	if notes != "" {
+		notesDoc, err := encodeTitleDocument(notes)
+		if err != nil {
+			return nil, fmt.Errorf("encode notes: %w", err)
+		}
+		fields["NotesDocument"] = FieldValue{
+			Value: notesDoc,
+			Type:  "ENCRYPTED_BYTES",
+		}
+	}
+
+	// Format list reference
+	listRecordName := listID
+	if !strings.HasPrefix(listID, "List/") {
+		listRecordName = "List/" + listID
+	}
+
+	// Add list reference
+	fields["List"] = FieldValue{
+		Value: map[string]interface{}{
+			"recordName": listRecordName,
+			"action":     "VALIDATE",
+			"zoneID": map[string]interface{}{
+				"zoneName":        RemindersZone,
+				"ownerRecordName": "_defaultOwner",
+				"zoneType":        "REGULAR_CUSTOM_ZONE",
+			},
+		},
+		Type: "REFERENCE",
+	}
+
+	record := Record{
+		RecordName: recordName,
+		RecordType: "Reminder",
+		Fields:     fields,
+		Parent: &RecordReference{
+			RecordName: listRecordName,
+		},
+	}
+
+	req := ModifyRequest{
+		ZoneID: s.zoneID,
+		Operations: []RecordOperation{
+			{
+				OperationType: "create",
+				Record:        record,
+			},
+		},
+	}
+
+	resp, err := s.client.ModifyRecords(
+		RemindersContainer, RemindersEnv, RemindersDB,
+		req,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create reminder: %w", err)
+	}
+
+	if len(resp.Records) == 0 {
+		return nil, fmt.Errorf("no record returned from create")
+	}
+
+	// Return the created reminder
+	item := s.parseReminder(resp.Records[0])
+	return &item, nil
+}
+
+// CompleteReminder marks a reminder as done
+func (s *RemindersService) CompleteReminder(reminderID string) error {
+	// Format record name
+	recordName := reminderID
+	if !strings.HasPrefix(reminderID, "Reminder/") {
+		recordName = "Reminder/" + reminderID
+	}
+
+	// First, lookup the existing record to get the change tag
+	resp, err := s.client.LookupRecords(
+		RemindersContainer, RemindersEnv, RemindersDB,
+		s.zoneID, []string{recordName},
+	)
+	if err != nil {
+		return fmt.Errorf("lookup reminder: %w", err)
+	}
+
+	if len(resp.Records) == 0 {
+		return fmt.Errorf("reminder not found: %s", reminderID)
+	}
+
+	existingRecord := resp.Records[0]
+	now := time.Now().UnixMilli()
+
+	// Update the record
+	record := Record{
+		RecordName:      recordName,
+		RecordType:      "Reminder",
+		RecordChangeTag: existingRecord.RecordChangeTag,
+		Fields: map[string]FieldValue{
+			"Completed": {
+				Value: 1,
+				Type:  "NUMBER_INT64",
+			},
+			"CompletionDate": {
+				Value: now,
+				Type:  "TIMESTAMP",
+			},
+			"LastModifiedDate": {
+				Value: now,
+				Type:  "TIMESTAMP",
+			},
+		},
+	}
+
+	req := ModifyRequest{
+		ZoneID: s.zoneID,
+		Operations: []RecordOperation{
+			{
+				OperationType: "update",
+				Record:        record,
+			},
+		},
+	}
+
+	_, err = s.client.ModifyRecords(
+		RemindersContainer, RemindersEnv, RemindersDB,
+		req,
+	)
+	if err != nil {
+		return fmt.Errorf("update reminder: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteReminder soft-deletes a reminder (moves to recently deleted)
+func (s *RemindersService) DeleteReminder(reminderID string) error {
+	// Format record name
+	recordName := reminderID
+	if !strings.HasPrefix(reminderID, "Reminder/") {
+		recordName = "Reminder/" + reminderID
+	}
+
+	// Lookup the existing record to get the change tag
+	resp, err := s.client.LookupRecords(
+		RemindersContainer, RemindersEnv, RemindersDB,
+		s.zoneID, []string{recordName},
+	)
+	if err != nil {
+		return fmt.Errorf("lookup reminder: %w", err)
+	}
+
+	if len(resp.Records) == 0 {
+		return fmt.Errorf("reminder not found: %s", reminderID)
+	}
+
+	existingRecord := resp.Records[0]
+	now := time.Now().UnixMilli()
+
+	// Soft delete by setting Deleted field to 1
+	record := Record{
+		RecordName:      recordName,
+		RecordType:      "Reminder",
+		RecordChangeTag: existingRecord.RecordChangeTag,
+		Fields: map[string]FieldValue{
+			"Deleted": {
+				Value: 1,
+				Type:  "NUMBER_INT64",
+			},
+			"LastModifiedDate": {
+				Value: now,
+				Type:  "TIMESTAMP",
+			},
+		},
+	}
+
+	req := ModifyRequest{
+		ZoneID: s.zoneID,
+		Operations: []RecordOperation{
+			{
+				OperationType: "update",
+				Record:        record,
+			},
+		},
+	}
+
+	_, err = s.client.ModifyRecords(
+		RemindersContainer, RemindersEnv, RemindersDB,
+		req,
+	)
+	if err != nil {
+		return fmt.Errorf("delete reminder: %w", err)
+	}
+
+	return nil
 }

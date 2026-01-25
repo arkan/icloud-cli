@@ -102,17 +102,40 @@ func (s *Service) GetReminders(listGUID string) ([]ParsedReminder, error) {
 	return result, nil
 }
 
-// Add creates a new reminder (not yet implemented for CloudKit)
-func (s *Service) Add(title, description, listGUID string, dueDate *time.Time) error {
-	return fmt.Errorf("add reminder via CloudKit not yet implemented")
+// Add creates a new reminder via CloudKit
+func (s *Service) Add(title, description, listGUID string, dueDate *time.Time, priority int) error {
+	// If no list specified, use the first available list
+	if listGUID == "" {
+		lists, err := s.cloudkitSvc.GetLists()
+		if err != nil {
+			return fmt.Errorf("get lists: %w", err)
+		}
+		if len(lists) == 0 {
+			return fmt.Errorf("no lists available")
+		}
+		listGUID = lists[0].ID
+	}
+
+	_, err := s.cloudkitSvc.AddReminder(title, description, listGUID, priority, dueDate)
+	if err != nil {
+		return fmt.Errorf("add reminder: %w", err)
+	}
+
+	return nil
 }
 
-// Complete marks a reminder as done (not yet implemented for CloudKit)
+// Complete marks a reminder as done via CloudKit
 func (s *Service) Complete(reminderGUID string) error {
-	return fmt.Errorf("complete reminder via CloudKit not yet implemented")
+	if err := s.cloudkitSvc.CompleteReminder(reminderGUID); err != nil {
+		return fmt.Errorf("complete reminder: %w", err)
+	}
+	return nil
 }
 
-// Delete removes a reminder (not yet implemented for CloudKit)
+// Delete removes a reminder via CloudKit (soft delete)
 func (s *Service) Delete(reminderGUID string) error {
-	return fmt.Errorf("delete reminder via CloudKit not yet implemented")
+	if err := s.cloudkitSvc.DeleteReminder(reminderGUID); err != nil {
+		return fmt.Errorf("delete reminder: %w", err)
+	}
+	return nil
 }

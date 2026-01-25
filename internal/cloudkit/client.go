@@ -190,3 +190,20 @@ func (c *Client) LookupRecords(container, env, database string, zoneID ZoneID, r
 
 	return &result, nil
 }
+
+// ModifyRecords creates, updates, or deletes records
+func (c *Client) ModifyRecords(container, env, database string, req ModifyRequest) (*RecordsResponse, error) {
+	path := c.buildPath(container, env, database, "records/modify")
+
+	body, err := c.request("POST", path, req)
+	if err != nil {
+		return nil, fmt.Errorf("modify records: %w", err)
+	}
+
+	var result RecordsResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse modify response: %w", err)
+	}
+
+	return &result, nil
+}
