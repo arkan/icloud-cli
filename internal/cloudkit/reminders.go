@@ -80,6 +80,13 @@ func (s *RemindersService) GetReminders(includeCompleted bool) ([]ReminderItem, 
 			continue
 		}
 
+		// Check soft-delete flag in Fields
+		if f, ok := r.Fields["Deleted"]; ok {
+			if v, ok := f.Value.(float64); ok && v == 1 {
+				continue
+			}
+		}
+
 		item := s.parseReminder(r)
 
 		// Filter completed if requested
