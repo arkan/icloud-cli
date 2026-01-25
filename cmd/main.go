@@ -458,6 +458,7 @@ type CloudkitCmd struct {
 	Zones     CKZonesCmd     `cmd:"" help:"List CloudKit zones"`
 	Records   CKRecordsCmd   `cmd:"" help:"Query CloudKit records"`
 	Dump      CKDumpCmd      `cmd:"" help:"Dump all records from a zone"`
+	Lookup    CKLookupCmd    `cmd:"" help:"Lookup specific records by name"`
 	Reminders CKRemindersCmd `cmd:"" aliases:"r" help:"List reminders via CloudKit"`
 }
 
@@ -583,6 +584,42 @@ func (c *CKRecordsCmd) Run() error {
 	if resp.ContinuationMarker != "" {
 		fmt.Println(color.YellowString("(more records available)"))
 	}
+
+	return nil
+}
+
+// CKLookupCmd looks up specific records by name
+type CKLookupCmd struct {
+	Container string   `short:"c" default:"com.apple.reminders" help:"Container ID"`
+	Env       string   `short:"e" default:"production" help:"Environment"`
+	Database  string   `short:"d" default:"private" help:"Database"`
+	Zone      string   `short:"z" default:"Reminders" help:"Zone name"`
+	Names     []string `arg:"" help:"Record names to lookup"`
+}
+
+func (c *CKLookupCmd) Run() error {
+	ckClient, err := getCloudKitClient()
+	if err != nil {
+		return err
+	}
+
+	zoneID := cloudkit.ZoneID{ZoneName: c.Zone}
+
+	fmt.Printf("Looking up %d records in %s/%s/%s zone=%s...\n\n",
+		len(c.Names), c.Container, c.Env, c.Database, c.Zone)
+
+	resp, err := ckClient.LookupRecords(c.Container, c.Env, c.Database, zoneID, c.Names)
+	if err != nil {
+		return fmt.Errorf("lookup records: %w", err)
+	}
+
+	if len(resp.Records) == 0 {
+		fmt.Println("No records found")
+		return nil
+	}
+
+	raw, _ := json.MarshalIndent(resp.Records, "", "  ")
+	fmt.Println(string(raw))
 
 	return nil
 }

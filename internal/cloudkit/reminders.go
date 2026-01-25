@@ -130,7 +130,7 @@ func (s *RemindersService) GetLists() ([]ReminderList, error) {
 		listRecordNames = append(listRecordNames, listID)
 	}
 
-	// Lookup list records to get their titles
+	// Lookup list records to get their names
 	listRecords := make(map[string]Record)
 	if len(listRecordNames) > 0 {
 		resp, err := s.client.LookupRecords(
@@ -155,7 +155,12 @@ func (s *RemindersService) GetLists() ([]ReminderList, error) {
 
 		title := ""
 		if r, ok := listRecords[listID]; ok {
-			title = s.decodeTitle(r)
+			// Extract Name field directly (it's stored in plain text)
+			if f, ok := r.Fields["Name"]; ok {
+				if v, ok := f.Value.(string); ok {
+					title = v
+				}
+			}
 		}
 		if title == "" {
 			title = "List " + uuid[:8]
