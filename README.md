@@ -15,6 +15,7 @@ CloudKit web service used by iCloud.com.
 - Persistent authenticated sessions
 - List and search reminders and lists
 - Add reminders with notes, due dates, and priorities
+- Create subtasks and set or clear flags
 - Edit titles, notes, due dates, and priorities (text updates are experimental)
 - Mark reminders complete (experimental)
 - Delete reminders
@@ -49,8 +50,11 @@ icloud reminders ls "Shopping"
 # Create and mutate reminders
 icloud reminders add "Buy milk" -l "Shopping"
 icloud reminders add "Call mom" --due "tomorrow 14:00" --priority high
+icloud reminders add "Buy detergent" --parent ABC12345
 icloud reminders edit ABC12345 --title "Buy oat milk" --description "Experimental"
 icloud reminders edit ABC12345 --due "2026-09-01" --priority medium
+icloud reminders edit ABC12345 --flagged
+icloud reminders edit ABC12345 --no-flagged
 icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
@@ -67,8 +71,9 @@ counts, and a document UUID.
 
 CloudKit operations also use:
 
-- the exact record names returned by the server, without invented `Reminder/`
-  or `List/` prefixes;
+- native `Reminder/<UUID>` names for newly created reminders, which are required
+  for parent/subtask relationships, and exact server-provided names thereafter;
+- exact list record names returned by the server;
 - the Reminders zone's real `ownerRecordName` from `zones/list`;
 - `changes/zone` and its delta token for synchronization;
 - `recordChangeTag` for conflict-safe updates and deletes;
@@ -111,6 +116,7 @@ and renders correctly. A dedicated test account is recommended.
   previous text. The command is exposed for accounts where that private API
   behavior differs. Priority and due-date updates are verified.
 - Clearing an existing due date is not yet exposed by the CLI.
+- Tags, assignments, attachments, locations, and alarms are not yet exposed.
 - Marking a reminder complete is experimental. CloudKit accepted the numeric
   `Completed` and `CompletionDate` fields but reconciled them back on one live
   account.

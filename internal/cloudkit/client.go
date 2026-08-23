@@ -146,7 +146,7 @@ func (c *Client) FetchChanges(container, env, database string, zoneID ZoneID, sy
 		DesiredKeys: []string{
 			"TitleDocument", "NotesDocument", "Name", "Completed",
 			"CompletionDate", "DueDate", "List", "Deleted", "Priority",
-			"ParentReminder", "CreationDate", "LastModifiedDate",
+			"ParentReminder", "Flagged", "CreationDate", "LastModifiedDate",
 		},
 	}
 	if syncToken != "" {

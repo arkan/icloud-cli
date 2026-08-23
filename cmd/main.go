@@ -176,6 +176,8 @@ type EditCmd struct {
 	Description string `short:"d" help:"Replacement description (experimental)"`
 	Due         string `help:"Replacement due date"`
 	Priority    string `short:"p" help:"Priority: high, medium, low, none"`
+	Flagged     bool   `help:"Set the flag"`
+	NoFlagged   bool   `name:"no-flagged" help:"Clear the flag"`
 }
 
 func (c *EditCmd) Run() error {
@@ -211,11 +213,19 @@ func (c *EditCmd) Run() error {
 		}
 		priority = &value
 	}
-	if title == nil && description == nil && dueDate == nil && priority == nil {
-		return fmt.Errorf("no changes specified; use --title, --description, --due, or --priority")
+	if c.Flagged && c.NoFlagged {
+		return fmt.Errorf("--flagged and --no-flagged are mutually exclusive")
+	}
+	var flagged *bool
+	if c.Flagged || c.NoFlagged {
+		value := c.Flagged
+		flagged = &value
+	}
+	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil {
+		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, or --no-flagged")
 	}
 	changes := cloudkit.ReminderChanges{
-		Title: title, Notes: description, DueDate: dueDate, Priority: priority,
+		Title: title, Notes: description, DueDate: dueDate, Priority: priority, Flagged: flagged,
 	}
 	if err := svc.Update(guid, changes); err != nil {
 		return fmt.Errorf("edit reminder: %w", err)
@@ -249,7 +259,7 @@ func resolveReminderID(svc *reminders.Service, id string) (string, error) {
 	}
 	for _, item := range items {
 		if strings.HasPrefix(strings.ToLower(item.GUID), strings.ToLower(id)) {
-			return item.GUID, nil
+			return item.RecordName, nil
 		}
 	}
 	return "", fmt.Errorf("reminder not found: %s", id)
@@ -394,6 +404,7 @@ type AddCmd struct {
 	Description string `short:"d" help:"Description"`
 	Due         string `help:"Due date (e.g., 'tomorrow 14:00', '2024-01-20')"`
 	Priority    string `short:"p" help:"Priority: high, medium, low (default: none)"`
+	Parent      string `help:"Parent reminder ID or unique prefix"`
 }
 
 func (c *AddCmd) Run() error {
@@ -436,7 +447,15 @@ func (c *AddCmd) Run() error {
 		}
 	}
 
-	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority); err != nil {
+	var parentGUID string
+	if c.Parent != "" {
+		parentGUID, err = resolveReminderID(svc, c.Parent)
+		if err != nil {
+			return fmt.Errorf("resolve parent reminder: %w", err)
+		}
+	}
+
+	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority, parentGUID); err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
 

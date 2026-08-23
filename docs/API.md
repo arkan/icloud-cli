@@ -168,7 +168,7 @@ Content-Type: application/json
     "operationType": "create",
     "record": {
       "recordType": "Reminder",
-      "recordName": "<UPPERCASE-UUID>",
+      "recordName": "Reminder/<UPPERCASE-UUID>",
       "fields": {
         "TitleDocument": {"value": "<base64-gzip-crdt>"},
         "Completed": {"value": 0},
@@ -184,8 +184,20 @@ Content-Type: application/json
 
 `TitleDocument` and `NotesDocument` use the Reminders CRDT protobuf structure;
 they are not plain strings and do not use the legacy minimal protobuf encoding.
-Do not invent `Reminder/` or `List/` prefixes and do not force CloudKit field
-types in the request.
+New reminder records use the native `Reminder/<UUID>` format. This prefix is
+required for parent/subtask relationships to synchronize correctly. Preserve
+exact record names returned by the server, preserve exact list record names,
+and do not force CloudKit field types in the request.
+
+To create a subtask, add a `ParentReminder` reference to a parent in the same
+list:
+
+```json
+"ParentReminder": {"value": {
+  "recordName": "Reminder/<PARENT-UUID>",
+  "action": "NONE"
+}}
+```
 
 ### Update scalar fields
 

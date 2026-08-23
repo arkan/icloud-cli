@@ -61,8 +61,8 @@ func TestAddReminderUsesRemindersCloudKitContract(t *testing.T) {
 		t.Fatalf("operations = %#v", modify.Operations)
 	}
 	record := modify.Operations[0].Record
-	if strings.Contains(record.RecordName, "/") || record.RecordName != strings.ToUpper(record.RecordName) {
-		t.Errorf("record name should be a bare uppercase UUID, got %q", record.RecordName)
+	if !strings.HasPrefix(record.RecordName, "Reminder/") || record.RecordName != "Reminder/"+strings.ToUpper(strings.TrimPrefix(record.RecordName, "Reminder/")) {
+		t.Errorf("record name should use the native Reminder/UUID format, got %q", record.RecordName)
 	}
 	if created.ID != record.RecordName {
 		t.Errorf("created ID = %q, want %q", created.ID, record.RecordName)
@@ -86,6 +86,52 @@ func TestAddReminderUsesRemindersCloudKitContract(t *testing.T) {
 		t.Errorf("TitleDocument should not force a CloudKit type, got %q", titleField.Type)
 	}
 	assertCRDTDocumentContains(t, titleField.Value.(string), "Café 🛒")
+}
+
+func TestAddReminderWithParentUsesParentsList(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/PARENT","recordType":"Reminder","recordChangeTag":"parent-change","fields":{"List":{"value":{"recordName":"List/SHOPPING","action":"NONE"}}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			record := modify.Operations[0].Record
+			_ = json.NewEncoder(w).Encode(RecordsResponse{Records: []Record{record}})
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	created, err := service.AddReminderWithParent("Child", "", "", 0, nil, "Reminder/PARENT")
+	if err != nil {
+		t.Fatalf("AddReminderWithParent: %v", err)
+	}
+
+	record := modify.Operations[0].Record
+	if created.ParentID != "Reminder/PARENT" {
+		t.Errorf("created parent ID = %q", created.ParentID)
+	}
+	parent, ok := record.Fields["ParentReminder"].Value.(map[string]interface{})
+	if !ok || parent["recordName"] != "Reminder/PARENT" || parent["action"] != "NONE" {
+		t.Errorf("parent reference = %#v", record.Fields["ParentReminder"])
+	}
+	list, ok := record.Fields["List"].Value.(map[string]interface{})
+	if !ok || list["recordName"] != "List/SHOPPING" {
+		t.Errorf("list reference = %#v", record.Fields["List"])
+	}
 }
 
 func TestFetchChangesUsesZoneEndpointAndOwner(t *testing.T) {
@@ -133,7 +179,7 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
 		case strings.Contains(r.URL.Path, "/records/lookup"):
 			lookupCount++
-			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"ABC-123","recordType":"Reminder","recordChangeTag":"change-%d"}]}`, lookupCount+6)
+			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"ABC-123","recordType":"Reminder","recordChangeTag":"change-%d","fields":{"ResolutionTokenMap":{"value":"{\"map\":{\"flagged\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"lastModifiedDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"}}}"}}}]}`, lookupCount+6)
 		case strings.Contains(r.URL.Path, "/records/modify"):
 			var request ModifyRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -154,7 +200,8 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 	service := newRemindersService(client, "")
 	priority := 5
 	title := "Experimental edit"
-	if err := service.UpdateReminder("ABC-123", ReminderChanges{Title: &title, Priority: &priority}); err != nil {
+	flagged := true
+	if err := service.UpdateReminder("ABC-123", ReminderChanges{Title: &title, Priority: &priority, Flagged: &flagged}); err != nil {
 		t.Fatalf("UpdateReminder: %v", err)
 	}
 	if err := service.CompleteReminder("ABC-123"); err != nil {
@@ -175,6 +222,16 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 		t.Errorf("priority field = %#v", edit.Record.Fields["Priority"])
 	}
 	assertCRDTDocumentContains(t, edit.Record.Fields["TitleDocument"].Value.(string), title)
+	if edit.Record.Fields["Flagged"].Value != float64(1) || edit.Record.Fields["Flagged"].Type != "NUMBER_INT64" {
+		t.Errorf("flagged field = %#v", edit.Record.Fields["Flagged"])
+	}
+	tokenJSON, _ := edit.Record.Fields["ResolutionTokenMap"].Value.(string)
+	if !strings.Contains(tokenJSON, `"counter":3`) || !strings.Contains(tokenJSON, `"replicaID":"device"`) {
+		t.Errorf("resolution token map = %s", tokenJSON)
+	}
+	if edit.Record.Fields["LastModifiedDate"].Type != "TIMESTAMP" {
+		t.Errorf("last modified field = %#v", edit.Record.Fields["LastModifiedDate"])
+	}
 	complete := operations[1]
 	if complete.Record.Fields["Completed"].Value != float64(1) {
 		t.Errorf("complete fields = %#v", complete.Record.Fields)

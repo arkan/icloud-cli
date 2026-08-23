@@ -26,6 +26,7 @@ type Collection struct {
 // ParsedReminder is a user-friendly reminder representation
 type ParsedReminder struct {
 	GUID        string
+	RecordName  string
 	ListGUID    string
 	ListName    string
 	Title       string
@@ -91,6 +92,7 @@ func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]Par
 
 		parsed := ParsedReminder{
 			GUID:        guid,
+			RecordName:  item.ID,
 			ListGUID:    item.ListID,
 			Title:       item.Title,
 			Description: item.Notes,
@@ -105,9 +107,9 @@ func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]Par
 }
 
 // Add creates a new reminder via CloudKit
-func (s *Service) Add(title, description, listGUID string, dueDate *time.Time, priority int) error {
+func (s *Service) Add(title, description, listGUID string, dueDate *time.Time, priority int, parentGUID string) error {
 	// If no list specified, use the first available list
-	if listGUID == "" {
+	if listGUID == "" && parentGUID == "" {
 		lists, err := s.cloudkitSvc.GetLists()
 		if err != nil {
 			return fmt.Errorf("get lists: %w", err)
@@ -118,7 +120,7 @@ func (s *Service) Add(title, description, listGUID string, dueDate *time.Time, p
 		listGUID = lists[0].ID
 	}
 
-	_, err := s.cloudkitSvc.AddReminder(title, description, listGUID, priority, dueDate)
+	_, err := s.cloudkitSvc.AddReminderWithParent(title, description, listGUID, priority, dueDate, parentGUID)
 	if err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}

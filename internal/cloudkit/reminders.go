@@ -44,9 +44,11 @@ type ReminderList struct {
 type ReminderItem struct {
 	ID           string
 	ListID       string
+	ParentID     string
 	Title        string
 	Notes        string
 	Priority     int
+	Flagged      bool
 	Completed    bool
 	DueDate      *time.Time
 	CreatedDate  time.Time
@@ -59,6 +61,7 @@ type ReminderChanges struct {
 	Notes    *string
 	Priority *int
 	DueDate  *time.Time
+	Flagged  *bool
 }
 
 // NewRemindersService creates a new CloudKit-based reminders service
@@ -329,6 +332,9 @@ func (s *RemindersService) parseReminder(r Record) ReminderItem {
 	}
 
 	item.ListID = recordListID(r)
+	if field, ok := r.Fields["ParentReminder"]; ok {
+		item.ParentID = recordListID(Record{Fields: map[string]FieldValue{"List": field}})
+	}
 
 	// Decode title
 	item.Title = s.decodeTitle(r)
@@ -342,6 +348,9 @@ func (s *RemindersService) parseReminder(r Record) ReminderItem {
 		if v, ok := f.Value.(float64); ok {
 			item.Priority = int(v)
 		}
+	}
+	if f, ok := r.Fields["Flagged"]; ok {
+		item.Flagged = fieldBool(f.Value)
 	}
 
 	if f, ok := r.Fields["CreationDate"]; ok {
@@ -685,10 +694,28 @@ func decodeVarint(data []byte) (uint64, int) {
 
 // AddReminder creates a new reminder in CloudKit
 func (s *RemindersService) AddReminder(title, notes, listID string, priority int, dueDate *time.Time) (*ReminderItem, error) {
+	return s.AddReminderWithParent(title, notes, listID, priority, dueDate, "")
+}
+
+// AddReminderWithParent creates a reminder and optionally links it as a subtask.
+func (s *RemindersService) AddReminderWithParent(title, notes, listID string, priority int, dueDate *time.Time, parentID string) (*ReminderItem, error) {
 	if err := s.ensureZone(); err != nil {
 		return nil, err
 	}
-	recordName := strings.ToUpper(uuid.New().String())
+	if parentID != "" {
+		parent, err := s.lookupReminder(parentID)
+		if err != nil {
+			return nil, fmt.Errorf("lookup parent reminder: %w", err)
+		}
+		parentListID := recordListID(parent)
+		if listID != "" && parentListID != "" && listID != parentListID {
+			return nil, fmt.Errorf("parent reminder belongs to list %s, not %s", parentListID, listID)
+		}
+		if listID == "" {
+			listID = parentListID
+		}
+	}
+	recordName := "Reminder/" + strings.ToUpper(uuid.New().String())
 
 	// Encode the title
 	titleDoc, err := encodeTitleDocument(title)
@@ -719,6 +746,9 @@ func (s *RemindersService) AddReminder(title, notes, listID string, priority int
 	}
 	if listID != "" {
 		fields["List"] = FieldValue{Value: RecordReference{RecordName: listID, Action: "NONE"}}
+	}
+	if parentID != "" {
+		fields["ParentReminder"] = FieldValue{Value: RecordReference{RecordName: parentID, Action: "NONE"}}
 	}
 
 	record := Record{
@@ -789,6 +819,16 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 	if changes.DueDate != nil {
 		fields["DueDate"] = FieldValue{Value: changes.DueDate.UnixMilli()}
 	}
+	if changes.Flagged != nil {
+		value := int64(0)
+		if *changes.Flagged {
+			value = 1
+		}
+		fields["Flagged"] = FieldValue{Value: value, Type: "NUMBER_INT64"}
+		if err := addResolutionTokenUpdate(existing, fields, "flagged"); err != nil {
+			return fmt.Errorf("update flag resolution token: %w", err)
+		}
+	}
 	if len(fields) == 0 {
 		return fmt.Errorf("no reminder changes specified")
 	}
@@ -817,6 +857,44 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 	}
 	s.records[reminderID] = mergeRecord(existing, response.Records[0])
 	s.persistCache()
+	return nil
+}
+
+func addResolutionTokenUpdate(record Record, fields map[string]FieldValue, key string) error {
+	tokenField, ok := record.Fields["ResolutionTokenMap"]
+	if !ok {
+		return fmt.Errorf("record has no ResolutionTokenMap")
+	}
+	encoded, ok := tokenField.Value.(string)
+	if !ok || encoded == "" {
+		return fmt.Errorf("record has an invalid ResolutionTokenMap")
+	}
+	var envelope struct {
+		Map map[string]map[string]interface{} `json:"map"`
+	}
+	if err := json.Unmarshal([]byte(encoded), &envelope); err != nil {
+		return err
+	}
+	now := time.Now()
+	coreDataTime := float64(now.UnixMilli())/1000 - 978307200
+	for _, tokenKey := range []string{key, "lastModifiedDate"} {
+		token, ok := envelope.Map[tokenKey]
+		if !ok {
+			return fmt.Errorf("resolution token %q is missing", tokenKey)
+		}
+		counter, ok := token["counter"].(float64)
+		if !ok {
+			return fmt.Errorf("resolution token %q has no numeric counter", tokenKey)
+		}
+		token["counter"] = counter + 1
+		token["modificationTime"] = coreDataTime
+	}
+	updated, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	fields["ResolutionTokenMap"] = FieldValue{Value: string(updated)}
+	fields["LastModifiedDate"] = FieldValue{Value: now.UnixMilli(), Type: "TIMESTAMP"}
 	return nil
 }
 
