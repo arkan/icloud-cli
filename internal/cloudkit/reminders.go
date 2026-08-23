@@ -40,6 +40,16 @@ type ReminderList struct {
 	Title string
 }
 
+// ReminderSharee is a participant who can be assigned reminders in a shared list.
+type ReminderSharee struct {
+	ParticipantID  string
+	UserRecordName string
+	DisplayName    string
+	Email          string
+	Phone          string
+	CurrentUser    bool
+}
+
 // ReminderItem represents a single reminder
 type ReminderItem struct {
 	ID           string
@@ -417,6 +427,22 @@ func recordListID(record Record) string {
 	}
 	if record.Parent != nil {
 		return record.Parent.RecordName
+	}
+	return ""
+}
+
+func recordReferenceName(field FieldValue) string {
+	switch value := field.Value.(type) {
+	case RecordReference:
+		return value.RecordName
+	case *RecordReference:
+		if value != nil {
+			return value.RecordName
+		}
+	case map[string]interface{}:
+		if name, ok := value["recordName"].(string); ok {
+			return name
+		}
 	}
 	return ""
 }
@@ -896,6 +922,220 @@ func addResolutionTokenUpdate(record Record, fields map[string]FieldValue, key s
 	fields["ResolutionTokenMap"] = FieldValue{Value: string(updated)}
 	fields["LastModifiedDate"] = FieldValue{Value: now.UnixMilli(), Type: "TIMESTAMP"}
 	return nil
+}
+
+// GetSharees returns the accepted participants of the CloudKit share rooted at listID.
+func (s *RemindersService) GetSharees(listID string) ([]ReminderSharee, error) {
+	if err := s.Sync(false); err != nil {
+		return nil, err
+	}
+	var shareNames []string
+	for _, record := range s.records {
+		if record.RecordType == "cloudkit.share" {
+			shareNames = append(shareNames, record.RecordName)
+		}
+	}
+	if len(shareNames) == 0 {
+		return nil, fmt.Errorf("list is not shared")
+	}
+	response, err := s.client.LookupRecords(
+		RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, shareNames,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("lookup list shares: %w", err)
+	}
+	for _, share := range response.Records {
+		if err := recordError(share); err != nil {
+			continue
+		}
+		if recordReferenceName(share.Fields["RootRecord"]) != listID {
+			continue
+		}
+		return acceptedSharees(share), nil
+	}
+	return nil, fmt.Errorf("list is not shared")
+}
+
+func acceptedSharees(share Record) []ReminderSharee {
+	participants := append([]ShareParticipant(nil), share.Participants...)
+	if share.Owner != nil {
+		participants = append(participants, *share.Owner)
+	}
+	currentID := ""
+	if share.CurrentUser != nil {
+		currentID = share.CurrentUser.ParticipantID
+		participants = append(participants, *share.CurrentUser)
+	}
+	seen := make(map[string]bool)
+	result := make([]ReminderSharee, 0, len(participants))
+	for _, participant := range participants {
+		if participant.ParticipantID == "" || seen[participant.ParticipantID] ||
+			!strings.EqualFold(participant.AcceptanceStatus, "ACCEPTED") {
+			continue
+		}
+		seen[participant.ParticipantID] = true
+		name := strings.TrimSpace(strings.Join([]string{
+			participant.UserIdentity.NameComponents.GivenName,
+			participant.UserIdentity.NameComponents.FamilyName,
+		}, " "))
+		result = append(result, ReminderSharee{
+			ParticipantID:  participant.ParticipantID,
+			UserRecordName: participant.UserIdentity.UserRecordName,
+			DisplayName:    name,
+			Email:          participant.UserIdentity.LookupInfo.EmailAddress,
+			Phone:          participant.UserIdentity.LookupInfo.PhoneNumber,
+			CurrentUser:    participant.ParticipantID == currentID,
+		})
+	}
+	return result
+}
+
+// UpdateAssignment assigns a shared reminder to one participant, or clears it.
+func (s *RemindersService) UpdateAssignment(reminderID, assignee string, clear bool) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+	listID := recordListID(existing)
+	if listID == "" {
+		return fmt.Errorf("reminder has no list")
+	}
+	sharees, err := s.GetSharees(listID)
+	if err != nil {
+		return err
+	}
+
+	var target *ReminderSharee
+	if !clear {
+		resolved, err := resolveSharee(sharees, assignee)
+		if err != nil {
+			return err
+		}
+		target = &resolved
+	}
+	var originator *ReminderSharee
+	for i := range sharees {
+		if sharees[i].CurrentUser {
+			originator = &sharees[i]
+			break
+		}
+	}
+	if originator == nil {
+		return fmt.Errorf("current user is not an accepted participant of the shared list")
+	}
+
+	currentIDs := fieldStringList(existing.Fields["AssignmentIDs"].Value)
+	if clear && len(currentIDs) == 0 {
+		return nil
+	}
+	childOperations := make([]RecordOperation, 0, len(currentIDs)+1)
+	if len(currentIDs) > 0 {
+		names := make([]string, 0, len(currentIDs))
+		for _, id := range currentIDs {
+			names = append(names, "Assignment/"+id)
+		}
+		lookup, err := s.client.LookupRecords(
+			RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, names,
+		)
+		if err != nil {
+			return fmt.Errorf("lookup current assignments: %w", err)
+		}
+		for _, record := range lookup.Records {
+			if err := recordError(record); err != nil {
+				return fmt.Errorf("lookup current assignment: %w", err)
+			}
+			childOperations = append(childOperations, RecordOperation{
+				OperationType: OperationDelete,
+				Record:        Record{RecordName: record.RecordName, RecordType: "Assignment", RecordChangeTag: record.RecordChangeTag},
+			})
+		}
+	}
+
+	now := time.Now()
+	assignmentIDs := []string{}
+	if target != nil {
+		id := strings.ToUpper(uuid.New().String())
+		assignmentIDs = []string{id}
+		childOperations = append(childOperations, RecordOperation{
+			OperationType: OperationCreate,
+			Record: Record{
+				RecordName: "Assignment/" + id,
+				RecordType: "Assignment",
+				Parent:     &RecordReference{RecordName: reminderID},
+				Fields: map[string]FieldValue{
+					"AssignedDate":                  {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+					"Deleted":                       {Value: int64(0), Type: "NUMBER_INT64"},
+					"EncryptedAssigneeIdentifier":   {Value: target.ParticipantID, Type: "STRING", IsEncrypted: true},
+					"EncryptedOriginatorIdentifier": {Value: originator.ParticipantID, Type: "STRING", IsEncrypted: true},
+					"Imported":                      {Value: int64(0), Type: "NUMBER_INT64"},
+					"OwningReminderIdentifier":      {Value: strings.TrimPrefix(reminderID, "Reminder/"), Type: "STRING"},
+					"Reminder":                      {Value: RecordReference{RecordName: reminderID, Action: "VALIDATE"}},
+					"Status":                        {Value: int64(1), Type: "NUMBER_INT64"},
+				},
+			},
+		})
+	}
+	tokenMap, err := newResolutionTokenMap("assignmentIDs", "lastModifiedDate")
+	if err != nil {
+		return err
+	}
+	operations := append([]RecordOperation{{
+		OperationType: OperationUpdate,
+		Record: Record{
+			RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag,
+			Fields: map[string]FieldValue{
+				"AssignmentIDs":      {Value: assignmentIDs, Type: "STRING_LIST"},
+				"ResolutionTokenMap": {Value: tokenMap, Type: "STRING"},
+				"LastModifiedDate":   {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+			},
+		},
+	}}, childOperations...)
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID, Operations: operations, Atomic: true,
+	})
+	if err != nil {
+		return fmt.Errorf("update assignment: %w", err)
+	}
+	if len(response.Records) != len(operations) {
+		return fmt.Errorf("update assignment: got %d records, want %d", len(response.Records), len(operations))
+	}
+	for _, record := range response.Records {
+		if err := recordError(record); err != nil {
+			return fmt.Errorf("update assignment: %w", err)
+		}
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
+}
+
+func resolveSharee(sharees []ReminderSharee, selector string) (ReminderSharee, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return ReminderSharee{}, fmt.Errorf("assignee cannot be empty")
+	}
+	var matches []ReminderSharee
+	for _, sharee := range sharees {
+		matched := strings.EqualFold(selector, sharee.ParticipantID) ||
+			strings.EqualFold(selector, sharee.UserRecordName) ||
+			strings.EqualFold(selector, sharee.Email) ||
+			strings.EqualFold(selector, sharee.Phone) ||
+			strings.EqualFold(selector, sharee.DisplayName) ||
+			(strings.EqualFold(selector, "me") && sharee.CurrentUser)
+		if matched {
+			matches = append(matches, sharee)
+		}
+	}
+	if len(matches) == 0 {
+		return ReminderSharee{}, fmt.Errorf("no accepted share participant matches %q", selector)
+	}
+	if len(matches) > 1 {
+		return ReminderSharee{}, fmt.Errorf("multiple share participants match %q; use an email or participant ID", selector)
+	}
+	return matches[0], nil
 }
 
 // UpdateTags atomically updates HashtagIDs and its linked Hashtag records.

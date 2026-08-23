@@ -161,12 +161,13 @@ func (c *StatusCmd) Run() error {
 
 // RemindersCmd is the parent command for reminders
 type RemindersCmd struct {
-	Lists ListsCmd `cmd:"" aliases:"ll" help:"List all reminder lists"`
-	Ls    LsCmd    `cmd:"" help:"List reminders"`
-	Add   AddCmd   `cmd:"" help:"Add a new reminder"`
-	Edit  EditCmd  `cmd:"" help:"Edit a reminder"`
-	Done  DoneCmd  `cmd:"" help:"Mark a reminder as done (experimental)"`
-	Rm    RmCmd    `cmd:"" help:"Delete a reminder"`
+	Lists   ListsCmd   `cmd:"" aliases:"ll" help:"List all reminder lists"`
+	Ls      LsCmd      `cmd:"" help:"List reminders"`
+	Sharees ShareesCmd `cmd:"" help:"List accepted participants of a shared list"`
+	Add     AddCmd     `cmd:"" help:"Add a new reminder"`
+	Edit    EditCmd    `cmd:"" help:"Edit a reminder"`
+	Done    DoneCmd    `cmd:"" help:"Mark a reminder as done (experimental)"`
+	Rm      RmCmd      `cmd:"" help:"Delete a reminder"`
 }
 
 // EditCmd updates selected reminder fields.
@@ -180,6 +181,8 @@ type EditCmd struct {
 	NoFlagged   bool     `name:"no-flagged" help:"Clear the flag"`
 	Tags        []string `name:"tag" help:"Add a native tag (repeatable)"`
 	RemoveTags  []string `name:"remove-tag" help:"Remove a native tag (repeatable)"`
+	Assign      string   `help:"Assign to a shared-list participant by name, email, or ID"`
+	Unassign    bool     `help:"Clear the current assignment"`
 }
 
 func (c *EditCmd) Run() error {
@@ -218,13 +221,16 @@ func (c *EditCmd) Run() error {
 	if c.Flagged && c.NoFlagged {
 		return fmt.Errorf("--flagged and --no-flagged are mutually exclusive")
 	}
+	if c.Assign != "" && c.Unassign {
+		return fmt.Errorf("--assign and --unassign are mutually exclusive")
+	}
 	var flagged *bool
 	if c.Flagged || c.NoFlagged {
 		value := c.Flagged
 		flagged = &value
 	}
-	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 {
-		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, --no-flagged, --tag, or --remove-tag")
+	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign {
+		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, --no-flagged, --tag, --remove-tag, --assign, or --unassign")
 	}
 	if title != nil || description != nil || dueDate != nil || priority != nil || flagged != nil {
 		changes := cloudkit.ReminderChanges{
@@ -239,7 +245,60 @@ func (c *EditCmd) Run() error {
 			return fmt.Errorf("edit reminder tags: %w", err)
 		}
 	}
+	if c.Assign != "" || c.Unassign {
+		if err := svc.UpdateAssignment(guid, c.Assign, c.Unassign); err != nil {
+			return fmt.Errorf("edit reminder assignment: %w", err)
+		}
+	}
 	color.Green("✓ Update submitted")
+	return nil
+}
+
+// ShareesCmd lists assignment candidates for one shared list.
+type ShareesCmd struct {
+	List string `arg:"" help:"Shared list name or GUID"`
+}
+
+func (c *ShareesCmd) Run() error {
+	svc, err := getRemindersService()
+	if err != nil {
+		return err
+	}
+	lists, err := svc.GetLists()
+	if err != nil {
+		return err
+	}
+	listID := ""
+	for _, list := range lists {
+		if strings.EqualFold(list.Title, c.List) || list.GUID == c.List {
+			if listID != "" {
+				return fmt.Errorf("multiple lists match %q; use the list GUID", c.List)
+			}
+			listID = list.GUID
+		}
+	}
+	if listID == "" {
+		return fmt.Errorf("list not found: %s", c.List)
+	}
+	sharees, err := svc.GetSharees(listID)
+	if err != nil {
+		return err
+	}
+	for _, sharee := range sharees {
+		name := sharee.DisplayName
+		if name == "" {
+			name = sharee.Email
+		}
+		marker := ""
+		if sharee.CurrentUser {
+			marker = " (me)"
+		}
+		fmt.Printf("%s%s\n", name, marker)
+		if sharee.Email != "" && !strings.EqualFold(name, sharee.Email) {
+			fmt.Printf("  %s\n", sharee.Email)
+		}
+		fmt.Printf("  ID: %s\n", sharee.ParticipantID)
+	}
 	return nil
 }
 

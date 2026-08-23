@@ -63,8 +63,37 @@ type Record struct {
 	Modified        *Timestamp            `json:"modified,omitempty"`
 	Deleted         bool                  `json:"deleted,omitempty"`
 	Parent          *RecordReference      `json:"parent,omitempty"`
+	Owner           *ShareParticipant     `json:"owner,omitempty"`
+	Participants    []ShareParticipant    `json:"participants,omitempty"`
+	CurrentUser     *ShareParticipant     `json:"currentUserParticipant,omitempty"`
 	ServerErrorCode string                `json:"serverErrorCode,omitempty"`
 	Reason          string                `json:"reason,omitempty"`
+}
+
+// ShareParticipant describes a user included in a CloudKit share.
+type ShareParticipant struct {
+	ParticipantID    string       `json:"participantId"`
+	AcceptanceStatus string       `json:"acceptanceStatus"`
+	Permission       string       `json:"permission"`
+	Type             string       `json:"type"`
+	UserIdentity     UserIdentity `json:"userIdentity"`
+}
+
+// UserIdentity contains the identity information CloudKit exposes for a share participant.
+type UserIdentity struct {
+	UserRecordName string         `json:"userRecordName"`
+	LookupInfo     UserLookupInfo `json:"lookupInfo"`
+	NameComponents NameComponents `json:"nameComponents"`
+}
+
+type UserLookupInfo struct {
+	EmailAddress string `json:"emailAddress,omitempty"`
+	PhoneNumber  string `json:"phoneNumber,omitempty"`
+}
+
+type NameComponents struct {
+	GivenName  string `json:"givenName,omitempty"`
+	FamilyName string `json:"familyName,omitempty"`
 }
 
 func recordError(record Record) error {

@@ -369,6 +369,160 @@ func TestRemoveTagUsesNativeDelete(t *testing.T) {
 	}
 }
 
+func TestAssignReminderUsesAtomicLinkedChildContract(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/changes/zone"):
+			_ = json.NewEncoder(w).Encode(ZoneChangesResponse{Zones: []ChangesResponse{{Records: []Record{{
+				RecordName: "Share/1", RecordType: "cloudkit.share",
+			}}}}})
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			var lookup LookupRequest
+			if err := json.NewDecoder(r.Body).Decode(&lookup); err != nil {
+				t.Errorf("decode lookup request: %v", err)
+			}
+			if len(lookup.Records) == 1 && lookup.Records[0].RecordName == "Reminder/R1" {
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"List":{"value":{"recordName":"List/SHARED","action":"NONE"}},"AssignmentIDs":{"value":[],"type":"EMPTY_LIST"}}}]}`)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(RecordsResponse{Records: []Record{{
+				RecordName: "Share/1", RecordType: "cloudkit.share",
+				Fields: map[string]FieldValue{"RootRecord": {Value: RecordReference{RecordName: "List/SHARED"}}},
+				Participants: []ShareParticipant{
+					{ParticipantID: "participant-me", AcceptanceStatus: "ACCEPTED", UserIdentity: UserIdentity{NameComponents: NameComponents{GivenName: "Current", FamilyName: "User"}}},
+					{ParticipantID: "participant-alex", AcceptanceStatus: "ACCEPTED", UserIdentity: UserIdentity{LookupInfo: UserLookupInfo{EmailAddress: "alex@example.com"}, NameComponents: NameComponents{GivenName: "Alex", FamilyName: "Smith"}}},
+				},
+				CurrentUser: &ShareParticipant{ParticipantID: "participant-me", AcceptanceStatus: "ACCEPTED"},
+			}}})
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateAssignment("Reminder/R1", "alex@example.com", false); err != nil {
+		t.Fatalf("UpdateAssignment: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	reminder := modify.Operations[0]
+	ids := fieldStringList(reminder.Record.Fields["AssignmentIDs"].Value)
+	if reminder.OperationType != OperationUpdate || len(ids) != 1 {
+		t.Fatalf("reminder operation = %#v", reminder)
+	}
+	child := modify.Operations[1]
+	if child.OperationType != OperationCreate || child.Record.RecordName != "Assignment/"+ids[0] {
+		t.Errorf("assignment operation = %#v", child)
+	}
+	if child.Record.Parent == nil || child.Record.Parent.RecordName != "Reminder/R1" {
+		t.Errorf("assignment parent = %#v", child.Record.Parent)
+	}
+	assignee := child.Record.Fields["EncryptedAssigneeIdentifier"]
+	originator := child.Record.Fields["EncryptedOriginatorIdentifier"]
+	if assignee.Value != "participant-alex" || assignee.Type != "STRING" || !assignee.IsEncrypted {
+		t.Errorf("assignee field = %#v", assignee)
+	}
+	if originator.Value != "participant-me" || originator.Type != "STRING" || !originator.IsEncrypted {
+		t.Errorf("originator field = %#v", originator)
+	}
+	if child.Record.Fields["OwningReminderIdentifier"].Value != "R1" || child.Record.Fields["Status"].Value != float64(1) {
+		t.Errorf("assignment fields = %#v", child.Record.Fields)
+	}
+	reference, _ := child.Record.Fields["Reminder"].Value.(map[string]interface{})
+	if reference["recordName"] != "Reminder/R1" || reference["action"] != "VALIDATE" {
+		t.Errorf("reminder reference = %#v", reference)
+	}
+	var tokens struct {
+		Map map[string]interface{} `json:"map"`
+	}
+	if err := json.Unmarshal([]byte(reminder.Record.Fields["ResolutionTokenMap"].Value.(string)), &tokens); err != nil {
+		t.Fatal(err)
+	}
+	if tokens.Map["assignmentIDs"] == nil || tokens.Map["lastModifiedDate"] == nil {
+		t.Errorf("resolution tokens = %#v", tokens.Map)
+	}
+}
+
+func TestUnassignReminderUsesNativeDelete(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/changes/zone"):
+			_, _ = io.WriteString(w, `{"zones":[{"records":[{"recordName":"Share/1","recordType":"cloudkit.share"}]}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			switch lookupCount {
+			case 1:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"List":{"value":{"recordName":"List/SHARED"}},"AssignmentIDs":{"value":["A1"],"type":"STRING_LIST"}}}]}`)
+			case 2:
+				_ = json.NewEncoder(w).Encode(RecordsResponse{Records: []Record{{
+					RecordName: "Share/1", RecordType: "cloudkit.share",
+					Fields:      map[string]FieldValue{"RootRecord": {Value: RecordReference{RecordName: "List/SHARED"}}},
+					CurrentUser: &ShareParticipant{ParticipantID: "participant-me", AcceptanceStatus: "ACCEPTED"},
+				}}})
+			case 3:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Assignment/A1","recordType":"Assignment","recordChangeTag":"assignment-change"}]}`)
+			}
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateAssignment("Reminder/R1", "", true); err != nil {
+		t.Fatalf("UpdateAssignment: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	if ids := fieldStringList(modify.Operations[0].Record.Fields["AssignmentIDs"].Value); len(ids) != 0 {
+		t.Errorf("remaining assignment IDs = %#v", ids)
+	}
+	deleted := modify.Operations[1]
+	if deleted.OperationType != OperationDelete || deleted.Record.RecordName != "Assignment/A1" || deleted.Record.RecordChangeTag != "assignment-change" {
+		t.Errorf("delete operation = %#v", deleted)
+	}
+}
+
 func TestSyncBuildsListsAndRemindersFromCloudKitFields(t *testing.T) {
 	t.Parallel()
 

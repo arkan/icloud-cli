@@ -274,6 +274,77 @@ Removal uses the same atomic reminder update and a native CloudKit `delete`
 operation for the Hashtag record. A soft `Deleted = 1` update remains visible
 in the iPhone app and can prevent deletion of the parent reminder.
 
+### Assign a shared reminder
+
+Assignment is available only when the reminder's list is the root of a
+`cloudkit.share`. Resolve a user from the share's accepted `participants`; the
+value stored by Reminders is the participant's `participantId`, not the email
+address or CloudKit `userRecordName`. The current participant is the
+assignment originator.
+
+Creation atomically updates the reminder's `AssignmentIDs` and creates a linked
+`Assignment` child:
+
+```json
+{
+  "atomic": true,
+  "operations": [
+    {
+      "operationType": "update",
+      "record": {
+        "recordType": "Reminder",
+        "recordName": "Reminder/<REMINDER-UUID>",
+        "recordChangeTag": "<current-change-tag>",
+        "fields": {
+          "AssignmentIDs": {
+            "type": "STRING_LIST",
+            "value": ["<ASSIGNMENT-UUID>"]
+          },
+          "ResolutionTokenMap": {"type": "STRING", "value": "<tokens>"},
+          "LastModifiedDate": {"type": "TIMESTAMP", "value": 1787523904000}
+        }
+      }
+    },
+    {
+      "operationType": "create",
+      "record": {
+        "recordType": "Assignment",
+        "recordName": "Assignment/<ASSIGNMENT-UUID>",
+        "parent": {"recordName": "Reminder/<REMINDER-UUID>"},
+        "fields": {
+          "AssignedDate": {"type": "TIMESTAMP", "value": 1787523904000},
+          "EncryptedAssigneeIdentifier": {
+            "type": "STRING",
+            "value": "<TARGET-PARTICIPANT-ID>",
+            "isEncrypted": true
+          },
+          "EncryptedOriginatorIdentifier": {
+            "type": "STRING",
+            "value": "<CURRENT-PARTICIPANT-ID>",
+            "isEncrypted": true
+          },
+          "OwningReminderIdentifier": {
+            "type": "STRING",
+            "value": "<REMINDER-UUID>"
+          },
+          "Reminder": {"value": {
+            "recordName": "Reminder/<REMINDER-UUID>",
+            "action": "VALIDATE"
+          }},
+          "Status": {"type": "NUMBER_INT64", "value": 1}
+        }
+      }
+    }
+  ]
+}
+```
+
+Reassignment deletes the previous `Assignment` child and creates the new child
+in the same atomic request. Unassignment writes an empty `AssignmentIDs` list
+and uses a native CloudKit `delete` for every previous assignment record. The
+production container accepts this contract, and both assignment and
+unassignment are verified in the native iPhone app.
+
 ### Delete a reminder
 
 Use the native operation and current change tag:

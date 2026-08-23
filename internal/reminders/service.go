@@ -23,6 +23,16 @@ type Collection struct {
 	Order int    `json:"order"`
 }
 
+// Sharee is a participant who can receive assignments in a shared list.
+type Sharee struct {
+	ParticipantID  string
+	UserRecordName string
+	DisplayName    string
+	Email          string
+	Phone          string
+	CurrentUser    bool
+}
+
 // ParsedReminder is a user-friendly reminder representation
 type ParsedReminder struct {
 	GUID        string
@@ -140,6 +150,34 @@ func (s *Service) Update(reminderGUID string, changes cloudkit.ReminderChanges) 
 func (s *Service) UpdateTags(reminderGUID string, add, remove []string) error {
 	if err := s.cloudkitSvc.UpdateTags(reminderGUID, add, remove); err != nil {
 		return fmt.Errorf("update tags: %w", err)
+	}
+	return nil
+}
+
+// GetSharees returns accepted participants for a shared list.
+func (s *Service) GetSharees(listGUID string) ([]Sharee, error) {
+	participants, err := s.cloudkitSvc.GetSharees(listGUID)
+	if err != nil {
+		return nil, fmt.Errorf("get sharees: %w", err)
+	}
+	result := make([]Sharee, 0, len(participants))
+	for _, participant := range participants {
+		result = append(result, Sharee{
+			ParticipantID:  participant.ParticipantID,
+			UserRecordName: participant.UserRecordName,
+			DisplayName:    participant.DisplayName,
+			Email:          participant.Email,
+			Phone:          participant.Phone,
+			CurrentUser:    participant.CurrentUser,
+		})
+	}
+	return result, nil
+}
+
+// UpdateAssignment assigns a shared reminder or clears its current assignment.
+func (s *Service) UpdateAssignment(reminderGUID, assignee string, clear bool) error {
+	if err := s.cloudkitSvc.UpdateAssignment(reminderGUID, assignee, clear); err != nil {
+		return fmt.Errorf("update assignment: %w", err)
 	}
 	return nil
 }
