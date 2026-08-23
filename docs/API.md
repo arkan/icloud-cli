@@ -227,6 +227,53 @@ Completion is also experimental: send numeric `Completed` and
 `CompletionDate`, but be aware that live tests observed CloudKit reconciling
 both fields back to the incomplete state.
 
+### Add or remove a native tag
+
+Tag creation atomically updates the reminder and creates a linked child record.
+The `Name` field must be a `STRING` with `isEncrypted: true`; sending raw or
+Base64-wrapped `ENCRYPTED_BYTES` is accepted by CloudKit but is not rendered as
+a native tag by the iPhone app.
+
+```json
+{
+  "atomic": true,
+  "operations": [
+    {
+      "operationType": "update",
+      "record": {
+        "recordType": "Reminder",
+        "recordName": "Reminder/<UUID>",
+        "recordChangeTag": "<current-change-tag>",
+        "fields": {
+          "HashtagIDs": {"type": "STRING_LIST", "value": ["<TAG-UUID>"]},
+          "ResolutionTokenMap": {"type": "STRING", "value": "<tokens>"},
+          "LastModifiedDate": {"type": "TIMESTAMP", "value": 1787514558862}
+        }
+      }
+    },
+    {
+      "operationType": "create",
+      "record": {
+        "recordType": "Hashtag",
+        "recordName": "Hashtag/<TAG-UUID>",
+        "parent": {"recordName": "Reminder/<UUID>"},
+        "fields": {
+          "Name": {"type": "STRING", "value": "work", "isEncrypted": true},
+          "Reminder": {"value": {
+            "recordName": "Reminder/<UUID>",
+            "action": "VALIDATE"
+          }}
+        }
+      }
+    }
+  ]
+}
+```
+
+Removal uses the same atomic reminder update and a native CloudKit `delete`
+operation for the Hashtag record. A soft `Deleted = 1` update remains visible
+in the iPhone app and can prevent deletion of the parent reminder.
+
 ### Delete a reminder
 
 Use the native operation and current change tag:

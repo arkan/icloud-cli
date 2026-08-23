@@ -898,6 +898,196 @@ func addResolutionTokenUpdate(record Record, fields map[string]FieldValue, key s
 	return nil
 }
 
+// UpdateTags atomically updates HashtagIDs and its linked Hashtag records.
+func (s *RemindersService) UpdateTags(reminderID string, add, remove []string) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+
+	type hashtag struct {
+		id     string
+		name   string
+		record Record
+	}
+	currentIDs := fieldStringList(existing.Fields["HashtagIDs"].Value)
+	current := make([]hashtag, 0, len(currentIDs))
+	for _, id := range currentIDs {
+		response, err := s.client.LookupRecords(
+			RemindersContainer, RemindersEnv, RemindersDB, s.zoneID,
+			[]string{"Hashtag/" + id},
+		)
+		if err != nil {
+			return fmt.Errorf("lookup tag %s: %w", id, err)
+		}
+		if len(response.Records) == 0 {
+			return fmt.Errorf("lookup tag %s: no record returned", id)
+		}
+		if err := recordError(response.Records[0]); err != nil {
+			return fmt.Errorf("lookup tag %s: %w", id, err)
+		}
+		record := response.Records[0]
+		current = append(current, hashtag{id: id, name: decodeCloudKitText(record.Fields["Name"]), record: record})
+	}
+
+	removeSet := normalizedTagSet(remove)
+	nameSet := make(map[string]bool)
+	ids := make([]string, 0, len(currentIDs)+len(add))
+	childOperations := make([]RecordOperation, 0, len(add)+len(remove))
+	for _, tag := range current {
+		if removeSet[strings.ToLower(tag.name)] {
+			childOperations = append(childOperations, RecordOperation{
+				OperationType: OperationDelete,
+				Record: Record{
+					RecordName:      tag.record.RecordName,
+					RecordType:      "Hashtag",
+					RecordChangeTag: tag.record.RecordChangeTag,
+				},
+			})
+			delete(removeSet, strings.ToLower(tag.name))
+			continue
+		}
+		ids = append(ids, tag.id)
+		nameSet[strings.ToLower(tag.name)] = true
+	}
+	if len(removeSet) > 0 {
+		for name := range removeSet {
+			return fmt.Errorf("tag not found: %s", name)
+		}
+	}
+
+	now := time.Now()
+	for _, rawName := range add {
+		name := normalizeTagName(rawName)
+		if name == "" {
+			return fmt.Errorf("tag name cannot be empty")
+		}
+		if nameSet[strings.ToLower(name)] {
+			continue
+		}
+		id := strings.ToUpper(uuid.New().String())
+		ids = append(ids, id)
+		nameSet[strings.ToLower(name)] = true
+		childOperations = append(childOperations, RecordOperation{
+			OperationType: OperationCreate,
+			Record: Record{
+				RecordName: "Hashtag/" + id,
+				RecordType: "Hashtag",
+				Parent:     &RecordReference{RecordName: reminderID},
+				Fields: map[string]FieldValue{
+					"Name": {
+						Value:       name,
+						Type:        "STRING",
+						IsEncrypted: true,
+					},
+					"Deleted":      {Value: int64(0), Type: "NUMBER_INT64"},
+					"Reminder":     {Value: RecordReference{RecordName: reminderID, Action: "VALIDATE"}},
+					"CreationDate": {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+				},
+			},
+		})
+	}
+	if len(childOperations) == 0 {
+		return nil
+	}
+
+	tokenMap, err := newResolutionTokenMap("hashtagIDs", "lastModifiedDate")
+	if err != nil {
+		return err
+	}
+	reminderOperation := RecordOperation{
+		OperationType: OperationUpdate,
+		Record: Record{
+			RecordName:      reminderID,
+			RecordType:      "Reminder",
+			RecordChangeTag: existing.RecordChangeTag,
+			Fields: map[string]FieldValue{
+				"HashtagIDs":         {Value: ids, Type: "STRING_LIST"},
+				"ResolutionTokenMap": {Value: tokenMap, Type: "STRING"},
+				"LastModifiedDate":   {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+			},
+		},
+	}
+	operations := append([]RecordOperation{reminderOperation}, childOperations...)
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID, Operations: operations, Atomic: true,
+	})
+	if err != nil {
+		return fmt.Errorf("update tags: %w", err)
+	}
+	if len(response.Records) != len(operations) {
+		return fmt.Errorf("update tags: got %d records, want %d", len(response.Records), len(operations))
+	}
+	for _, record := range response.Records {
+		if err := recordError(record); err != nil {
+			return fmt.Errorf("update tags: %w", err)
+		}
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
+}
+
+func normalizeTagName(name string) string {
+	return strings.TrimPrefix(strings.TrimSpace(name), "#")
+}
+
+func normalizedTagSet(names []string) map[string]bool {
+	result := make(map[string]bool)
+	for _, name := range names {
+		if normalized := normalizeTagName(name); normalized != "" {
+			result[strings.ToLower(normalized)] = true
+		}
+	}
+	return result
+}
+
+func fieldStringList(value interface{}) []string {
+	switch values := value.(type) {
+	case []string:
+		return append([]string(nil), values...)
+	case []interface{}:
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				result = append(result, text)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func decodeCloudKitText(field FieldValue) string {
+	value, _ := field.Value.(string)
+	if field.Type != "ENCRYPTED_BYTES" {
+		return value
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+func newResolutionTokenMap(keys ...string) (string, error) {
+	appleTime := float64(time.Now().UnixMilli())/1000 - 978307200
+	tokens := make(map[string]map[string]interface{}, len(keys))
+	for _, key := range keys {
+		tokens[key] = map[string]interface{}{
+			"counter":          1,
+			"modificationTime": appleTime,
+			"replicaID":        strings.ToUpper(uuid.New().String()),
+		}
+	}
+	encoded, err := json.Marshal(map[string]interface{}{"map": tokens})
+	return string(encoded), err
+}
+
 // CompleteReminder submits the completion fields used by Reminders. CloudKit
 // may reconcile this undocumented mutation back to the previous state.
 func (s *RemindersService) CompleteReminder(reminderID string) error {

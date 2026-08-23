@@ -248,6 +248,127 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 	}
 }
 
+func TestCreateTagUsesAtomicLinkedChildContract(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"change-1","fields":{"HashtagIDs":{"value":[],"type":"EMPTY_LIST"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateTags("Reminder/R1", []string{"#café"}, nil); err != nil {
+		t.Fatalf("UpdateTags: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	reminder := modify.Operations[0]
+	if reminder.OperationType != OperationUpdate || reminder.Record.RecordChangeTag != "change-1" {
+		t.Errorf("reminder operation = %#v", reminder)
+	}
+	ids := fieldStringList(reminder.Record.Fields["HashtagIDs"].Value)
+	if len(ids) != 1 {
+		t.Fatalf("hashtag IDs = %#v", ids)
+	}
+	var tokens struct {
+		Map map[string]interface{} `json:"map"`
+	}
+	if err := json.Unmarshal([]byte(reminder.Record.Fields["ResolutionTokenMap"].Value.(string)), &tokens); err != nil {
+		t.Fatal(err)
+	}
+	if tokens.Map["hashtagIDs"] == nil || tokens.Map["lastModifiedDate"] == nil {
+		t.Errorf("resolution tokens = %#v", tokens.Map)
+	}
+	child := modify.Operations[1]
+	if child.OperationType != OperationCreate || child.Record.RecordName != "Hashtag/"+ids[0] {
+		t.Errorf("child operation = %#v", child)
+	}
+	if child.Record.Parent == nil || child.Record.Parent.RecordName != "Reminder/R1" {
+		t.Errorf("child parent = %#v", child.Record.Parent)
+	}
+	name := child.Record.Fields["Name"]
+	if name.Type != "STRING" || name.Value != "café" || !name.IsEncrypted {
+		t.Errorf("tag name = %#v", name)
+	}
+	reference, _ := child.Record.Fields["Reminder"].Value.(map[string]interface{})
+	if reference["recordName"] != "Reminder/R1" || reference["action"] != "VALIDATE" {
+		t.Errorf("reminder reference = %#v", reference)
+	}
+}
+
+func TestRemoveTagUsesNativeDelete(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			if lookupCount == 1 {
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"HashtagIDs":{"value":["TAG-1"],"type":"STRING_LIST"}}}]}`)
+			} else {
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Hashtag/TAG-1","recordType":"Hashtag","recordChangeTag":"tag-change","fields":{"Name":{"value":"travel","type":"STRING","isEncrypted":true}}}]}`)
+			}
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateTags("Reminder/R1", nil, []string{"travel"}); err != nil {
+		t.Fatalf("UpdateTags: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	if ids := fieldStringList(modify.Operations[0].Record.Fields["HashtagIDs"].Value); len(ids) != 0 {
+		t.Errorf("remaining hashtag IDs = %#v", ids)
+	}
+	deleted := modify.Operations[1]
+	if deleted.OperationType != OperationDelete || deleted.Record.RecordName != "Hashtag/TAG-1" || deleted.Record.RecordChangeTag != "tag-change" {
+		t.Errorf("delete operation = %#v", deleted)
+	}
+}
+
 func TestSyncBuildsListsAndRemindersFromCloudKitFields(t *testing.T) {
 	t.Parallel()
 

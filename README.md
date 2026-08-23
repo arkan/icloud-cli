@@ -15,7 +15,7 @@ CloudKit web service used by iCloud.com.
 - Persistent authenticated sessions
 - List and search reminders and lists
 - Add reminders with notes, due dates, and priorities
-- Create subtasks and set or clear flags
+- Create subtasks, manage native tags, and set or clear flags
 - Edit titles, notes, due dates, and priorities (text updates are experimental)
 - Mark reminders complete (experimental)
 - Delete reminders
@@ -55,6 +55,8 @@ icloud reminders edit ABC12345 --title "Buy oat milk" --description "Experimenta
 icloud reminders edit ABC12345 --due "2026-09-01" --priority medium
 icloud reminders edit ABC12345 --flagged
 icloud reminders edit ABC12345 --no-flagged
+icloud reminders edit ABC12345 --tag work --tag urgent
+icloud reminders edit ABC12345 --remove-tag work
 icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
@@ -116,7 +118,9 @@ and renders correctly. A dedicated test account is recommended.
   previous text. The command is exposed for accounts where that private API
   behavior differs. Priority and due-date updates are verified.
 - Clearing an existing due date is not yet exposed by the CLI.
-- Tags, assignments, attachments, locations, and alarms are not yet exposed.
+- Tag creation and removal are verified. Renaming tags is not exposed; remove
+  the old tag and add the replacement instead.
+- Assignments, attachments, locations, and alarms are not yet exposed.
 - Marking a reminder complete is experimental. CloudKit accepted the numeric
   `Completed` and `CompletionDate` fields but reconciled them back on one live
   account.

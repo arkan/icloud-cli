@@ -136,6 +136,14 @@ func (s *Service) Update(reminderGUID string, changes cloudkit.ReminderChanges) 
 	return nil
 }
 
+// UpdateTags adds and removes native Reminders tags.
+func (s *Service) UpdateTags(reminderGUID string, add, remove []string) error {
+	if err := s.cloudkitSvc.UpdateTags(reminderGUID, add, remove); err != nil {
+		return fmt.Errorf("update tags: %w", err)
+	}
+	return nil
+}
+
 // Complete submits a completion mutation via CloudKit.
 func (s *Service) Complete(reminderGUID string) error {
 	if err := s.cloudkitSvc.CompleteReminder(reminderGUID); err != nil {

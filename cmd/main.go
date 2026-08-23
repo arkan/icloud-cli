@@ -171,13 +171,15 @@ type RemindersCmd struct {
 
 // EditCmd updates selected reminder fields.
 type EditCmd struct {
-	ID          string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
-	Title       string `help:"Replacement title (experimental)"`
-	Description string `short:"d" help:"Replacement description (experimental)"`
-	Due         string `help:"Replacement due date"`
-	Priority    string `short:"p" help:"Priority: high, medium, low, none"`
-	Flagged     bool   `help:"Set the flag"`
-	NoFlagged   bool   `name:"no-flagged" help:"Clear the flag"`
+	ID          string   `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
+	Title       string   `help:"Replacement title (experimental)"`
+	Description string   `short:"d" help:"Replacement description (experimental)"`
+	Due         string   `help:"Replacement due date"`
+	Priority    string   `short:"p" help:"Priority: high, medium, low, none"`
+	Flagged     bool     `help:"Set the flag"`
+	NoFlagged   bool     `name:"no-flagged" help:"Clear the flag"`
+	Tags        []string `name:"tag" help:"Add a native tag (repeatable)"`
+	RemoveTags  []string `name:"remove-tag" help:"Remove a native tag (repeatable)"`
 }
 
 func (c *EditCmd) Run() error {
@@ -221,14 +223,21 @@ func (c *EditCmd) Run() error {
 		value := c.Flagged
 		flagged = &value
 	}
-	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil {
-		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, or --no-flagged")
+	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 {
+		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, --no-flagged, --tag, or --remove-tag")
 	}
-	changes := cloudkit.ReminderChanges{
-		Title: title, Notes: description, DueDate: dueDate, Priority: priority, Flagged: flagged,
+	if title != nil || description != nil || dueDate != nil || priority != nil || flagged != nil {
+		changes := cloudkit.ReminderChanges{
+			Title: title, Notes: description, DueDate: dueDate, Priority: priority, Flagged: flagged,
+		}
+		if err := svc.Update(guid, changes); err != nil {
+			return fmt.Errorf("edit reminder: %w", err)
+		}
 	}
-	if err := svc.Update(guid, changes); err != nil {
-		return fmt.Errorf("edit reminder: %w", err)
+	if len(c.Tags) > 0 || len(c.RemoveTags) > 0 {
+		if err := svc.UpdateTags(guid, c.Tags, c.RemoveTags); err != nil {
+			return fmt.Errorf("edit reminder tags: %w", err)
+		}
 	}
 	color.Green("✓ Update submitted")
 	return nil

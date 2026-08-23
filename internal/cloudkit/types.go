@@ -40,8 +40,9 @@ type ZoneChangesResponse struct {
 
 // FieldValue represents a CloudKit field value
 type FieldValue struct {
-	Value interface{} `json:"value"`
-	Type  string      `json:"type,omitempty"`
+	Value       interface{} `json:"value"`
+	Type        string      `json:"type,omitempty"`
+	IsEncrypted bool        `json:"isEncrypted,omitempty"`
 }
 
 // RecordReference represents a reference to another record
@@ -132,6 +133,7 @@ type RecordRef struct {
 type ModifyRequest struct {
 	ZoneID     ZoneID            `json:"zoneID"`
 	Operations []RecordOperation `json:"operations"`
+	Atomic     bool              `json:"atomic,omitempty"`
 }
 
 type OperationType string
