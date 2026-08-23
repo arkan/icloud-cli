@@ -172,17 +172,24 @@ type RemindersCmd struct {
 
 // EditCmd updates selected reminder fields.
 type EditCmd struct {
-	ID          string   `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
-	Title       string   `help:"Replacement title (experimental)"`
-	Description string   `short:"d" help:"Replacement description (experimental)"`
-	Due         string   `help:"Replacement due date"`
-	Priority    string   `short:"p" help:"Priority: high, medium, low, none"`
-	Flagged     bool     `help:"Set the flag"`
-	NoFlagged   bool     `name:"no-flagged" help:"Clear the flag"`
-	Tags        []string `name:"tag" help:"Add a native tag (repeatable)"`
-	RemoveTags  []string `name:"remove-tag" help:"Remove a native tag (repeatable)"`
-	Assign      string   `help:"Assign to a shared-list participant by name, email, or ID"`
-	Unassign    bool     `help:"Clear the current assignment"`
+	ID            string   `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
+	Title         string   `help:"Replacement title (experimental)"`
+	Description   string   `short:"d" help:"Replacement description (experimental)"`
+	Due           string   `help:"Replacement due date"`
+	Priority      string   `short:"p" help:"Priority: high, medium, low, none"`
+	Flagged       bool     `help:"Set the flag"`
+	NoFlagged     bool     `name:"no-flagged" help:"Clear the flag"`
+	Tags          []string `name:"tag" help:"Add a native tag (repeatable)"`
+	RemoveTags    []string `name:"remove-tag" help:"Remove a native tag (repeatable)"`
+	Assign        string   `help:"Assign to a shared-list participant by name, email, or ID"`
+	Unassign      bool     `help:"Clear the current assignment"`
+	LocationTitle string   `help:"Location alarm title"`
+	Address       string   `help:"Optional location alarm address"`
+	Latitude      *float64 `help:"Location alarm latitude"`
+	Longitude     *float64 `help:"Location alarm longitude"`
+	Radius        float64  `default:"100" help:"Location alarm radius in meters"`
+	Proximity     string   `default:"arriving" help:"Location alarm proximity: arriving or leaving"`
+	ClearLocation bool     `help:"Remove the location alarm"`
 }
 
 func (c *EditCmd) Run() error {
@@ -224,13 +231,35 @@ func (c *EditCmd) Run() error {
 	if c.Assign != "" && c.Unassign {
 		return fmt.Errorf("--assign and --unassign are mutually exclusive")
 	}
+	locationRequested := c.LocationTitle != "" || c.Address != "" || c.Latitude != nil || c.Longitude != nil
+	if locationRequested && c.ClearLocation {
+		return fmt.Errorf("location options and --clear-location are mutually exclusive")
+	}
+	var location *cloudkit.LocationAlarm
+	if locationRequested {
+		if c.Latitude == nil || c.Longitude == nil {
+			return fmt.Errorf("location alarm requires --latitude and --longitude")
+		}
+		proximity, err := parseProximity(c.Proximity)
+		if err != nil {
+			return err
+		}
+		title := strings.TrimSpace(c.LocationTitle)
+		if title == "" {
+			title = "Location"
+		}
+		location = &cloudkit.LocationAlarm{
+			Title: title, Address: c.Address, Latitude: *c.Latitude, Longitude: *c.Longitude,
+			Radius: c.Radius, Proximity: proximity,
+		}
+	}
 	var flagged *bool
 	if c.Flagged || c.NoFlagged {
 		value := c.Flagged
 		flagged = &value
 	}
-	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign {
-		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, --no-flagged, --tag, --remove-tag, --assign, or --unassign")
+	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation {
+		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, --no-flagged, --tag, --remove-tag, --assign, --unassign, location options, or --clear-location")
 	}
 	if title != nil || description != nil || dueDate != nil || priority != nil || flagged != nil {
 		changes := cloudkit.ReminderChanges{
@@ -250,8 +279,24 @@ func (c *EditCmd) Run() error {
 			return fmt.Errorf("edit reminder assignment: %w", err)
 		}
 	}
+	if location != nil || c.ClearLocation {
+		if err := svc.UpdateLocationAlarm(guid, location); err != nil {
+			return fmt.Errorf("edit reminder location: %w", err)
+		}
+	}
 	color.Green("✓ Update submitted")
 	return nil
+}
+
+func parseProximity(value string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "arriving", "arrive", "enter", "entering":
+		return 1, nil
+	case "leaving", "leave", "exit", "exiting":
+		return 2, nil
+	default:
+		return 0, fmt.Errorf("invalid proximity %q; use arriving or leaving", value)
+	}
 }
 
 // ShareesCmd lists assignment candidates for one shared list.

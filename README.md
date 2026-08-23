@@ -15,7 +15,7 @@ CloudKit web service used by iCloud.com.
 - Persistent authenticated sessions
 - List and search reminders and lists
 - Add reminders with notes, due dates, and priorities
-- Create subtasks, manage native tags, set or clear flags, and assign shared reminders
+- Create subtasks, manage native tags, set or clear flags, assign shared reminders, and manage location alarms
 - Edit titles, notes, due dates, and priorities (text updates are experimental)
 - Mark reminders complete (experimental)
 - Delete reminders
@@ -61,6 +61,9 @@ icloud reminders sharees "Shared Shopping"
 icloud reminders edit ABC12345 --assign alex@example.com
 icloud reminders edit ABC12345 --assign me
 icloud reminders edit ABC12345 --unassign
+icloud reminders edit ABC12345 --location-title "Office" --address "1 Infinite Loop" \
+  --latitude 37.3318 --longitude -122.0312 --radius 150 --proximity arriving
+icloud reminders edit ABC12345 --clear-location
 icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
@@ -125,7 +128,11 @@ and renders correctly. A dedicated test account is recommended.
 - Tag creation and removal are verified. Renaming tags is not exposed; remove
   the old tag and add the replacement instead.
 - Shared-list assignment and unassignment are verified for accepted participants.
-- Attachments, locations, and alarms are not yet exposed.
+- Location alarm creation, replacement, and removal are verified in the native
+  iPhone app. Coordinates are required; `--proximity` accepts `arriving` or
+  `leaving`. iOS chooses a radius in its own UI but does not expose a radius
+  control; the CLI accepts an explicit radius in meters.
+- Attachments and time-based alarm management are not yet exposed.
 - Marking a reminder complete is experimental. CloudKit accepted the numeric
   `Completed` and `CompletionDate` fields but reconciled them back on one live
   account.

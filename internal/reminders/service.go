@@ -182,6 +182,14 @@ func (s *Service) UpdateAssignment(reminderGUID, assignee string, clear bool) er
 	return nil
 }
 
+// UpdateLocationAlarm replaces or clears the reminder's location alarm.
+func (s *Service) UpdateLocationAlarm(reminderGUID string, location *cloudkit.LocationAlarm) error {
+	if err := s.cloudkitSvc.UpdateLocationAlarm(reminderGUID, location); err != nil {
+		return fmt.Errorf("update location alarm: %w", err)
+	}
+	return nil
+}
+
 // Complete submits a completion mutation via CloudKit.
 func (s *Service) Complete(reminderGUID string) error {
 	if err := s.cloudkitSvc.CompleteReminder(reminderGUID); err != nil {

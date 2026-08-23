@@ -345,6 +345,30 @@ and uses a native CloudKit `delete` for every previous assignment record. The
 production container accepts this contract, and both assignment and
 unassignment are verified in the native iPhone app.
 
+### Add, replace, or remove a location alarm
+
+A location alarm is represented by two linked children: an `Alarm` below the
+reminder and an `AlarmTrigger` below the alarm. The reminder stores the raw
+alarm UUID in `AlarmIDs`. Creation updates all three records atomically.
+
+The request-side numeric type names are `NUMBER_INT64` and `NUMBER_DOUBLE`.
+The alarm's `DueDateResolutionTokenAsNonce` is `0`, and the trigger includes
+`Imported = 0`. These details were captured from a location created by the
+native iPhone app; the superficially similar `INT64`/`DOUBLE` payload used by
+some third-party clients is rejected by the production container.
+
+The location trigger contains encrypted `Title`, `Address`, `Latitude`,
+`Longitude`, and `ReferenceFrameString` fields, plus the unencrypted radius and
+proximity. Proximity `1` means arriving and `2` means leaving. Although iOS
+does not expose a radius control, it persists a numeric radius chosen by the
+native UI; the CLI therefore accepts the radius explicitly in meters.
+
+Replacement and removal first inspect all linked alarms. Only triggers whose
+`Type` is `Location` are deleted, so time-based alarms remain attached. Child
+records are removed with native CloudKit `delete` operations and their current
+change tags. Creation, replacement, and removal are verified in the native
+iPhone app.
+
 ### Delete a reminder
 
 Use the native operation and current change tag:

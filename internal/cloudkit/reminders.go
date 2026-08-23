@@ -74,6 +74,16 @@ type ReminderChanges struct {
 	Flagged  *bool
 }
 
+// LocationAlarm describes a geofence trigger for a reminder.
+type LocationAlarm struct {
+	Title     string
+	Address   string
+	Latitude  float64
+	Longitude float64
+	Radius    float64
+	Proximity int
+}
+
 // NewRemindersService creates a new CloudKit-based reminders service
 func NewRemindersService(client *Client) *RemindersService {
 	cachePath := ""
@@ -1136,6 +1146,178 @@ func resolveSharee(sharees []ReminderSharee, selector string) (ReminderSharee, e
 		return ReminderSharee{}, fmt.Errorf("multiple share participants match %q; use an email or participant ID", selector)
 	}
 	return matches[0], nil
+}
+
+// UpdateLocationAlarm replaces the reminder's location alarm or clears it.
+// Other alarm types remain linked to the reminder.
+func (s *RemindersService) UpdateLocationAlarm(reminderID string, location *LocationAlarm) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	if location != nil {
+		if location.Latitude < -90 || location.Latitude > 90 {
+			return fmt.Errorf("latitude must be between -90 and 90")
+		}
+		if location.Longitude < -180 || location.Longitude > 180 {
+			return fmt.Errorf("longitude must be between -180 and 180")
+		}
+		if location.Radius <= 0 || location.Radius > 100000 {
+			return fmt.Errorf("radius must be greater than 0 and at most 100000 meters")
+		}
+		if location.Proximity != 1 && location.Proximity != 2 {
+			return fmt.Errorf("proximity must be arriving or leaving")
+		}
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+
+	remainingAlarmIDs, deleteOperations, err := s.locationAlarmDeletes(
+		fieldStringList(existing.Fields["AlarmIDs"].Value),
+	)
+	if err != nil {
+		return err
+	}
+	if location == nil && len(deleteOperations) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	childOperations := deleteOperations
+	if location != nil {
+		alarmID := strings.ToUpper(uuid.New().String())
+		triggerID := strings.ToUpper(uuid.New().String())
+		locationID := strings.ToUpper(uuid.New().String())
+		remainingAlarmIDs = append(remainingAlarmIDs, alarmID)
+		alarmName := "Alarm/" + alarmID
+		childOperations = append(childOperations,
+			RecordOperation{
+				OperationType: OperationCreate,
+				Record: Record{
+					RecordName: alarmName,
+					RecordType: "Alarm",
+					Parent:     &RecordReference{RecordName: reminderID},
+					Fields: map[string]FieldValue{
+						"AlarmUID":                      {Value: alarmID, Type: "STRING"},
+						"Deleted":                       {Value: int64(0), Type: "NUMBER_INT64"},
+						"Imported":                      {Value: int64(0), Type: "NUMBER_INT64"},
+						"Reminder":                      {Value: RecordReference{RecordName: reminderID, Action: "VALIDATE"}, Type: "REFERENCE"},
+						"TriggerID":                     {Value: triggerID, Type: "STRING"},
+						"DueDateResolutionTokenAsNonce": {Value: float64(0), Type: "NUMBER_DOUBLE"},
+					},
+				},
+			},
+			RecordOperation{
+				OperationType: OperationCreate,
+				Record: Record{
+					RecordName: "AlarmTrigger/" + triggerID,
+					RecordType: "AlarmTrigger",
+					Parent:     &RecordReference{RecordName: alarmName},
+					Fields: map[string]FieldValue{
+						"Address":              {Value: location.Address, Type: "STRING", IsEncrypted: true},
+						"Alarm":                {Value: RecordReference{RecordName: alarmName, Action: "VALIDATE"}, Type: "REFERENCE"},
+						"Deleted":              {Value: int64(0), Type: "NUMBER_INT64"},
+						"Imported":             {Value: int64(0), Type: "NUMBER_INT64"},
+						"Latitude":             {Value: location.Latitude, Type: "NUMBER_DOUBLE", IsEncrypted: true},
+						"LocationUID":          {Value: locationID, Type: "STRING"},
+						"Longitude":            {Value: location.Longitude, Type: "NUMBER_DOUBLE", IsEncrypted: true},
+						"Proximity":            {Value: int64(location.Proximity), Type: "NUMBER_INT64"},
+						"Radius":               {Value: location.Radius, Type: "NUMBER_DOUBLE"},
+						"ReferenceFrameString": {Value: "1", Type: "STRING", IsEncrypted: true},
+						"Title":                {Value: location.Title, Type: "STRING", IsEncrypted: true},
+						"Type":                 {Value: "Location", Type: "STRING"},
+					},
+				},
+			},
+		)
+	}
+
+	tokenMap, err := newResolutionTokenMap("lastModifiedDate")
+	if err != nil {
+		return err
+	}
+	operations := append([]RecordOperation{{
+		OperationType: OperationUpdate,
+		Record: Record{
+			RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag,
+			Fields: map[string]FieldValue{
+				"AlarmIDs":           {Value: remainingAlarmIDs, Type: "STRING_LIST"},
+				"ResolutionTokenMap": {Value: tokenMap, Type: "STRING"},
+				"LastModifiedDate":   {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+			},
+		},
+	}}, childOperations...)
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID, Operations: operations, Atomic: true,
+	})
+	if err != nil {
+		return fmt.Errorf("update location alarm: %w", err)
+	}
+	if len(response.Records) != len(operations) {
+		return fmt.Errorf("update location alarm: got %d records, want %d", len(response.Records), len(operations))
+	}
+	for _, record := range response.Records {
+		if err := recordError(record); err != nil {
+			return fmt.Errorf("update location alarm: %w", err)
+		}
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
+}
+
+func (s *RemindersService) locationAlarmDeletes(alarmIDs []string) ([]string, []RecordOperation, error) {
+	if len(alarmIDs) == 0 {
+		return nil, nil, nil
+	}
+	alarmNames := make([]string, 0, len(alarmIDs))
+	for _, id := range alarmIDs {
+		alarmNames = append(alarmNames, "Alarm/"+id)
+	}
+	alarms, err := s.client.LookupRecords(RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, alarmNames)
+	if err != nil {
+		return nil, nil, fmt.Errorf("lookup reminder alarms: %w", err)
+	}
+	remaining := make([]string, 0, len(alarmIDs))
+	deletes := make([]RecordOperation, 0)
+	for _, alarm := range alarms.Records {
+		if err := recordError(alarm); err != nil {
+			return nil, nil, fmt.Errorf("lookup reminder alarm: %w", err)
+		}
+		triggerID, _ := alarm.Fields["TriggerID"].Value.(string)
+		if triggerID == "" {
+			remaining = append(remaining, strings.TrimPrefix(alarm.RecordName, "Alarm/"))
+			continue
+		}
+		triggers, err := s.client.LookupRecords(
+			RemindersContainer, RemindersEnv, RemindersDB, s.zoneID,
+			[]string{"AlarmTrigger/" + triggerID},
+		)
+		if err != nil {
+			return nil, nil, fmt.Errorf("lookup alarm trigger: %w", err)
+		}
+		if len(triggers.Records) == 0 {
+			return nil, nil, fmt.Errorf("alarm trigger not found: %s", triggerID)
+		}
+		trigger := triggers.Records[0]
+		if err := recordError(trigger); err != nil {
+			return nil, nil, fmt.Errorf("lookup alarm trigger: %w", err)
+		}
+		if trigger.Fields["Type"].Value != "Location" {
+			remaining = append(remaining, strings.TrimPrefix(alarm.RecordName, "Alarm/"))
+			continue
+		}
+		deletes = append(deletes,
+			RecordOperation{OperationType: OperationDelete, Record: Record{
+				RecordName: trigger.RecordName, RecordType: "AlarmTrigger", RecordChangeTag: trigger.RecordChangeTag,
+			}},
+			RecordOperation{OperationType: OperationDelete, Record: Record{
+				RecordName: alarm.RecordName, RecordType: "Alarm", RecordChangeTag: alarm.RecordChangeTag,
+			}},
+		)
+	}
+	return remaining, deletes, nil
 }
 
 // UpdateTags atomically updates HashtagIDs and its linked Hashtag records.

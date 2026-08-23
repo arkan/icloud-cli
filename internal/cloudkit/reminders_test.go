@@ -523,6 +523,161 @@ func TestUnassignReminderUsesNativeDelete(t *testing.T) {
 	}
 }
 
+func TestCreateLocationAlarmUsesAtomicAlarmAndTriggerContract(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AlarmIDs":{"value":[],"type":"EMPTY_LIST"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	location := LocationAlarm{
+		Title: "Eiffel Tower", Address: "Paris", Latitude: 48.8584, Longitude: 2.2945,
+		Radius: 150, Proximity: 1,
+	}
+	if err := service.UpdateLocationAlarm("Reminder/R1", &location); err != nil {
+		t.Fatalf("UpdateLocationAlarm: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 3 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	reminder := modify.Operations[0]
+	alarmIDs := fieldStringList(reminder.Record.Fields["AlarmIDs"].Value)
+	if reminder.OperationType != OperationUpdate || len(alarmIDs) != 1 {
+		t.Fatalf("reminder operation = %#v", reminder)
+	}
+	var tokens struct {
+		Map map[string]interface{} `json:"map"`
+	}
+	if err := json.Unmarshal([]byte(reminder.Record.Fields["ResolutionTokenMap"].Value.(string)), &tokens); err != nil {
+		t.Fatal(err)
+	}
+	if tokens.Map["alarmIDs"] != nil || tokens.Map["lastModifiedDate"] == nil {
+		t.Errorf("resolution tokens = %#v", tokens.Map)
+	}
+	alarm := modify.Operations[1]
+	if alarm.OperationType != OperationCreate || alarm.Record.RecordName != "Alarm/"+alarmIDs[0] {
+		t.Errorf("alarm operation = %#v", alarm)
+	}
+	if alarm.Record.Parent == nil || alarm.Record.Parent.RecordName != "Reminder/R1" {
+		t.Errorf("alarm parent = %#v", alarm.Record.Parent)
+	}
+	if alarm.Record.Fields["DueDateResolutionTokenAsNonce"].Value != float64(0) ||
+		alarm.Record.Fields["DueDateResolutionTokenAsNonce"].Type != "NUMBER_DOUBLE" {
+		t.Errorf("alarm nonce = %#v", alarm.Record.Fields["DueDateResolutionTokenAsNonce"])
+	}
+	triggerID, _ := alarm.Record.Fields["TriggerID"].Value.(string)
+	trigger := modify.Operations[2]
+	if trigger.OperationType != OperationCreate || trigger.Record.RecordName != "AlarmTrigger/"+triggerID {
+		t.Errorf("trigger operation = %#v", trigger)
+	}
+	if trigger.Record.Parent == nil || trigger.Record.Parent.RecordName != alarm.Record.RecordName {
+		t.Errorf("trigger parent = %#v", trigger.Record.Parent)
+	}
+	for _, fieldName := range []string{"Title", "Address", "Latitude", "Longitude", "ReferenceFrameString"} {
+		if !trigger.Record.Fields[fieldName].IsEncrypted {
+			t.Errorf("%s should be encrypted: %#v", fieldName, trigger.Record.Fields[fieldName])
+		}
+	}
+	if trigger.Record.Fields["Imported"].Value != float64(0) || trigger.Record.Fields["Imported"].Type != "NUMBER_INT64" {
+		t.Errorf("trigger imported field = %#v", trigger.Record.Fields["Imported"])
+	}
+	if trigger.Record.Fields["Title"].Value != "Eiffel Tower" ||
+		trigger.Record.Fields["Latitude"].Value != float64(48.8584) ||
+		trigger.Record.Fields["Longitude"].Value != float64(2.2945) ||
+		trigger.Record.Fields["Radius"].Value != float64(150) ||
+		trigger.Record.Fields["Proximity"].Value != float64(1) ||
+		trigger.Record.Fields["Type"].Value != "Location" {
+		t.Errorf("trigger fields = %#v", trigger.Record.Fields)
+	}
+	reference, _ := trigger.Record.Fields["Alarm"].Value.(map[string]interface{})
+	if reference["recordName"] != alarm.Record.RecordName || reference["action"] != "VALIDATE" {
+		t.Errorf("alarm reference = %#v", reference)
+	}
+}
+
+func TestClearLocationAlarmPreservesOtherAlarmTypes(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			switch lookupCount {
+			case 1:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AlarmIDs":{"value":["LOC","TIME"],"type":"STRING_LIST"}}}]}`)
+			case 2:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Alarm/LOC","recordType":"Alarm","recordChangeTag":"alarm-loc-change","fields":{"TriggerID":{"value":"TRIG-LOC"}}},{"recordName":"Alarm/TIME","recordType":"Alarm","recordChangeTag":"alarm-time-change","fields":{"TriggerID":{"value":"TRIG-TIME"}}}]}`)
+			case 3:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"AlarmTrigger/TRIG-LOC","recordType":"AlarmTrigger","recordChangeTag":"trigger-loc-change","fields":{"Type":{"value":"Location"}}}]}`)
+			case 4:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"AlarmTrigger/TRIG-TIME","recordType":"AlarmTrigger","recordChangeTag":"trigger-time-change","fields":{"Type":{"value":"Date"}}}]}`)
+			}
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateLocationAlarm("Reminder/R1", nil); err != nil {
+		t.Fatalf("UpdateLocationAlarm: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 3 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	if ids := fieldStringList(modify.Operations[0].Record.Fields["AlarmIDs"].Value); len(ids) != 1 || ids[0] != "TIME" {
+		t.Errorf("remaining alarm IDs = %#v", ids)
+	}
+	triggerDelete := modify.Operations[1]
+	alarmDelete := modify.Operations[2]
+	if triggerDelete.OperationType != OperationDelete || triggerDelete.Record.RecordName != "AlarmTrigger/TRIG-LOC" || triggerDelete.Record.RecordChangeTag != "trigger-loc-change" {
+		t.Errorf("trigger delete = %#v", triggerDelete)
+	}
+	if alarmDelete.OperationType != OperationDelete || alarmDelete.Record.RecordName != "Alarm/LOC" || alarmDelete.Record.RecordChangeTag != "alarm-loc-change" {
+		t.Errorf("alarm delete = %#v", alarmDelete)
+	}
+}
+
 func TestSyncBuildsListsAndRemindersFromCloudKitFields(t *testing.T) {
 	t.Parallel()
 
