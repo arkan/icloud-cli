@@ -1,6 +1,8 @@
 // Package cloudkit provides access to iCloud CloudKit services
 package cloudkit
 
+import "fmt"
+
 // ZoneID identifies a CloudKit zone
 type ZoneID struct {
 	ZoneName        string `json:"zoneName"`
@@ -19,6 +21,23 @@ type ZonesResponse struct {
 	Zones []Zone `json:"zones"`
 }
 
+// ZoneChangesRequest is the CloudKit changes/zone payload.
+type ZoneChangesRequest struct {
+	Zones []ZoneChangesSpec `json:"zones"`
+}
+
+// ZoneChangesSpec selects one custom zone and an optional delta token.
+type ZoneChangesSpec struct {
+	ZoneID      ZoneID   `json:"zoneID"`
+	DesiredKeys []string `json:"desiredKeys,omitempty"`
+	SyncToken   string   `json:"syncToken,omitempty"`
+}
+
+// ZoneChangesResponse wraps each requested zone's changes.
+type ZoneChangesResponse struct {
+	Zones []ChangesResponse `json:"zones"`
+}
+
 // FieldValue represents a CloudKit field value
 type FieldValue struct {
 	Value interface{} `json:"value"`
@@ -27,29 +46,38 @@ type FieldValue struct {
 
 // RecordReference represents a reference to another record
 type RecordReference struct {
-	RecordName string `json:"recordName"`
-	Action     string `json:"action,omitempty"`
+	RecordName string  `json:"recordName"`
+	Action     string  `json:"action,omitempty"`
 	ZoneID     *ZoneID `json:"zoneID,omitempty"`
 }
 
 // Record represents a CloudKit record
 type Record struct {
-	RecordName       string                `json:"recordName"`
-	RecordType       string                `json:"recordType"`
-	RecordChangeTag  string                `json:"recordChangeTag,omitempty"`
-	Fields           map[string]FieldValue `json:"fields,omitempty"`
-	PluginFields     map[string]FieldValue `json:"pluginFields,omitempty"`
-	Created          *Timestamp            `json:"created,omitempty"`
-	Modified         *Timestamp            `json:"modified,omitempty"`
-	Deleted          bool                  `json:"deleted,omitempty"`
-	Parent           *RecordReference      `json:"parent,omitempty"`
+	RecordName      string                `json:"recordName"`
+	RecordType      string                `json:"recordType"`
+	RecordChangeTag string                `json:"recordChangeTag,omitempty"`
+	Fields          map[string]FieldValue `json:"fields,omitempty"`
+	PluginFields    map[string]FieldValue `json:"pluginFields,omitempty"`
+	Created         *Timestamp            `json:"created,omitempty"`
+	Modified        *Timestamp            `json:"modified,omitempty"`
+	Deleted         bool                  `json:"deleted,omitempty"`
+	Parent          *RecordReference      `json:"parent,omitempty"`
+	ServerErrorCode string                `json:"serverErrorCode,omitempty"`
+	Reason          string                `json:"reason,omitempty"`
+}
+
+func recordError(record Record) error {
+	if record.ServerErrorCode == "" {
+		return nil
+	}
+	return fmt.Errorf("CloudKit error %s: %s", record.ServerErrorCode, record.Reason)
 }
 
 // Timestamp represents a CloudKit timestamp
 type Timestamp struct {
-	Timestamp   int64  `json:"timestamp"`
-	UserID      string `json:"userRecordName,omitempty"`
-	DeviceID    string `json:"deviceID,omitempty"`
+	Timestamp int64  `json:"timestamp"`
+	UserID    string `json:"userRecordName,omitempty"`
+	DeviceID  string `json:"deviceID,omitempty"`
 }
 
 // Filter represents a query filter
@@ -76,11 +104,11 @@ type Query struct {
 
 // QueryRequest is the request body for records/query
 type QueryRequest struct {
-	ZoneID             ZoneID `json:"zoneID"`
-	Query              Query  `json:"query"`
-	ResultsLimit       int    `json:"resultsLimit,omitempty"`
+	ZoneID             ZoneID   `json:"zoneID"`
+	Query              Query    `json:"query"`
+	ResultsLimit       int      `json:"resultsLimit,omitempty"`
 	DesiredKeys        []string `json:"desiredKeys,omitempty"`
-	ContinuationMarker string `json:"continuationMarker,omitempty"`
+	ContinuationMarker string   `json:"continuationMarker,omitempty"`
 }
 
 // RecordsResponse is the response from records/query
@@ -102,19 +130,27 @@ type RecordRef struct {
 
 // ModifyRequest is the request body for records/modify
 type ModifyRequest struct {
-	ZoneID     ZoneID           `json:"zoneID"`
+	ZoneID     ZoneID            `json:"zoneID"`
 	Operations []RecordOperation `json:"operations"`
 }
 
+type OperationType string
+
+const (
+	OperationCreate OperationType = "create"
+	OperationUpdate OperationType = "update"
+	OperationDelete OperationType = "delete"
+)
+
 // RecordOperation represents a create/update/delete operation
 type RecordOperation struct {
-	OperationType string  `json:"operationType"` // create, update, forceUpdate, replace, forceReplace, delete, forceDelete
-	Record        Record  `json:"record"`
+	OperationType OperationType `json:"operationType"`
+	Record        Record        `json:"record"`
 }
 
 // ErrorResponse represents a CloudKit error
 type ErrorResponse struct {
-	UUID           string `json:"uuid"`
+	UUID            string `json:"uuid"`
 	ServerErrorCode string `json:"serverErrorCode"`
-	Reason         string `json:"reason"`
+	Reason          string `json:"reason"`
 }

@@ -67,9 +67,11 @@ func (s *Service) GetLists() ([]Collection, error) {
 	return result, nil
 }
 
-// GetReminders returns all reminders for a specific list via CloudKit
-func (s *Service) GetReminders(listGUID string) ([]ParsedReminder, error) {
-	items, err := s.cloudkitSvc.GetReminders(false) // exclude completed
+// GetReminders returns reminders for a specific list via CloudKit. Completed
+// reminders are excluded unless includeCompleted is true.
+func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]ParsedReminder, error) {
+	includeDone := len(includeCompleted) > 0 && includeCompleted[0]
+	items, err := s.cloudkitSvc.GetReminders(includeDone)
 	if err != nil {
 		return nil, fmt.Errorf("get reminders: %w", err)
 	}
@@ -124,15 +126,15 @@ func (s *Service) Add(title, description, listGUID string, dueDate *time.Time, p
 	return nil
 }
 
-// Complete marks a reminder as done via CloudKit
-func (s *Service) Complete(reminderGUID string) error {
-	if err := s.cloudkitSvc.CompleteReminder(reminderGUID); err != nil {
-		return fmt.Errorf("complete reminder: %w", err)
+// Update applies selected changes to an existing reminder.
+func (s *Service) Update(reminderGUID string, changes cloudkit.ReminderChanges) error {
+	if err := s.cloudkitSvc.UpdateReminder(reminderGUID, changes); err != nil {
+		return fmt.Errorf("update reminder: %w", err)
 	}
 	return nil
 }
 
-// Delete removes a reminder via CloudKit (soft delete)
+// Delete removes a reminder via CloudKit.
 func (s *Service) Delete(reminderGUID string) error {
 	if err := s.cloudkitSvc.DeleteReminder(reminderGUID); err != nil {
 		return fmt.Errorf("delete reminder: %w", err)

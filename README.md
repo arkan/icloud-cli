@@ -1,96 +1,127 @@
 # iCloud CLI
 
-> **PROJECT ARCHIVED** - This project has been discontinued due to fundamental technical limitations with Apple's end-to-end encryption. See [Technical Limitations](#technical-limitations) below.
+A command-line interface for Apple iCloud Reminders using the undocumented
+CloudKit web service used by iCloud.com.
 
-A command-line interface for accessing iCloud Reminders via CloudKit.
+> **Experimental write support** — the previous E2EE blocker was a protocol
+> misdiagnosis. The current implementation writes the complete Reminders CRDT
+> document format and uses account-specific CloudKit zone metadata. Automated
+> contract tests pass, but a live Apple-device sync must still be verified for
+> each relevant account configuration before relying on it.
 
-## What Works
+## Features
 
-- **Reading** reminders and lists via CloudKit API
-- Authentication with 2FA support
-- Session persistence
+- Apple ID authentication with 2FA support
+- Persistent authenticated sessions
+- List and search reminders and lists
+- Add reminders with notes, due dates, and priorities
+- Edit due dates and priorities
+- Delete reminders
+- CloudKit delta synchronization with optimistic locking
 
-## What Doesn't Work (and never will)
-
-- **Creating** reminders
-- **Completing** reminders
-- **Deleting** reminders
-
-## Technical Limitations
-
-### The Problem
-
-Apple Reminders uses **end-to-end encryption (E2EE)** via CloudKit. Every reminder record requires:
-
-- `chainProtectionInfo` - ASN.1 blob with EC P-256 signatures
-- `chainParentKey` - Reference to parent list's encryption key
-- `chainPrivateKey` - Record's private key, encrypted with parent's key
-
-### Why It Can't Be Fixed
-
-The encryption keys are stored in **iCloud Keychain**, which:
-
-1. Is only accessible from trusted Apple devices
-2. Uses Hardware Security Modules (HSM) with destroyed admin cards
-3. Requires SRP protocol authentication (password never leaves device)
-4. Needs 2FA verification on a trusted device
-
-This is not a bug or missing feature - Apple explicitly designed the system to prevent third-party access to write operations.
-
-### What We Tried
-
-| Approach | Result |
-|----------|--------|
-| Create records without encryption | Records created but invisible to other devices |
-| Reverse-engineer protobuf format | Solved (TitleDocument format) |
-| Analyze ASN.1 encryption structure | Identified EC P-256, but keys inaccessible |
-| Search for keys in CloudKit zones | Keys only exist in Keychain |
-
-### Possible Workarounds (Not Implemented)
-
-If you need to create reminders from Linux:
-
-1. **Mac mini proxy** - SSH to a Mac running AppleScript
-2. **iPhone Shortcuts webhook** - HTTP request triggers native Shortcut
-3. **GitHub Actions macOS runner** - Legal macOS VM in the cloud
-
-## Installation (Read-Only Use)
+## Installation
 
 ```bash
 go install github.com/arkan/icloud-cli/cmd@latest
 ```
 
+Or build from source:
+
+```bash
+git clone https://github.com/arkan/icloud-cli.git
+cd icloud-cli
+go build -o icloud ./cmd/
+```
+
 ## Usage
 
 ```bash
-# Login
+# Authenticate and inspect the session
 icloud login user@example.com
+icloud status
 
-# List reminder lists (works)
+# Read reminders
 icloud reminders lists
-
-# List reminders (works)
 icloud reminders ls
 icloud reminders ls "Shopping"
 
-# These commands exist but WILL FAIL due to E2EE:
-icloud reminders add "Test"    # Creates record, won't sync
-icloud reminders done abc123   # May work locally, won't sync
-icloud reminders rm abc123     # May work locally, won't sync
+# Create and mutate reminders
+icloud reminders add "Buy milk" -l "Shopping"
+icloud reminders add "Call mom" --due "tomorrow 14:00" --priority high
+icloud reminders edit ABC12345 --due "2026-09-01" --priority medium
+icloud reminders rm ABC12345
 ```
 
-## Project Status
+Reminder commands accept a full CloudKit record name or a unique prefix shown
+by `icloud reminders ls`.
 
-**ARCHIVED** - No further development planned.
+## How writes work
 
-The fundamental limitation (E2EE keys in Keychain) cannot be solved without:
-- An Apple device in the loop, OR
-- Apple providing a write API (unlikely)
+Reminders titles and notes are not plain strings. They are CRDT documents
+encoded as protobuf, gzip, and Base64. Creation now supplies the full document
+structure, including operations, positions, replica metadata, Unicode character
+counts, and a document UUID.
 
-## References
+CloudKit operations also use:
 
-- [Apple Security Guide - CloudKit E2EE](https://support.apple.com/guide/security/cloudkit-end-to-end-encryption-sec3cac31735/web)
-- [Apple Security Guide - iCloud Keychain Escrow](https://support.apple.com/guide/security/escrow-security-for-icloud-keychain-sec3e341e75d/web)
+- the exact record names returned by the server, without invented `Reminder/`
+  or `List/` prefixes;
+- the Reminders zone's real `ownerRecordName` from `zones/list`;
+- `changes/zone` and its delta token for synchronization;
+- `recordChangeTag` for conflict-safe updates and deletes;
+- the native CloudKit `delete` operation rather than a synthetic `Deleted`
+  field update.
+
+The `chainProtectionInfo`, `chainParentKey`, and `chainPrivateKey` fields seen on
+existing records are not generated by this client. Current evidence indicates
+that they are not client-supplied prerequisites for this CloudKit web write
+path. This API remains undocumented and Apple may change that behavior.
+
+## Verification
+
+The default suite is read-only and uses local HTTP test servers:
+
+```bash
+go test ./...
+go vet ./...
+```
+
+The live lifecycle test creates, reads, updates, and deletes a uniquely named
+reminder using the session in `~/.icloud-cli/session.json`. It is deliberately
+opt-in because it writes to the authenticated account:
+
+```bash
+ICLOUD_INTEGRATION=1 go test ./internal/cloudkit \
+  -run TestIntegrationReminderLifecycle -v
+```
+
+After the create step, also confirm on an Apple device that the reminder appears
+and renders correctly. A dedicated test account is recommended.
+
+## Known limitations
+
+- The CloudKit API and Reminders CRDT format are undocumented.
+- Live behavior may differ with Advanced Data Protection, shared lists, or
+  future Apple server changes.
+- Editing a title or notes is not supported. Live tests show that CloudKit
+  accepts a replacement CRDT document but reconciles it back to the previous
+  text. The reference project currently uses that same unverified replacement
+  strategy. Priority and due-date updates are supported.
+- Clearing an existing due date is not yet exposed by the CLI.
+- Marking a reminder complete is not supported. Both `Completed` and
+  `CompletionDate` updates are accepted and then reconciled back by CloudKit.
+- The local CloudKit cache contains reminder metadata and is specific to the
+  authenticated zone owner. Remove it to force a full resynchronization.
+
+## Configuration
+
+Session data is stored with mode `0600` in `~/.icloud-cli/session.json`. The
+derived CloudKit record cache is stored with the same permissions in
+`~/.icloud-cli/cloudkit-cache.json`.
+
+## API documentation
+
+See [docs/API.md](docs/API.md) for the reverse-engineered protocol notes.
 
 ## License
 

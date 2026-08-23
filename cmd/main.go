@@ -110,7 +110,7 @@ func handle2FA(authenticator *auth.Authenticator) error {
 	color.Yellow("→ Two-factor authentication required")
 	fmt.Println("A verification code has been sent to your trusted devices.")
 	fmt.Print("Enter code: ")
-	
+
 	var code string
 	fmt.Scanln(&code)
 	code = strings.TrimSpace(code)
@@ -164,8 +164,85 @@ type RemindersCmd struct {
 	Lists ListsCmd `cmd:"" aliases:"ll" help:"List all reminder lists"`
 	Ls    LsCmd    `cmd:"" help:"List reminders"`
 	Add   AddCmd   `cmd:"" help:"Add a new reminder"`
-	Done  DoneCmd  `cmd:"" help:"Mark a reminder as done"`
+	Edit  EditCmd  `cmd:"" help:"Edit a reminder"`
 	Rm    RmCmd    `cmd:"" help:"Delete a reminder"`
+}
+
+// EditCmd updates selected reminder fields.
+type EditCmd struct {
+	ID       string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
+	Due      string `help:"Replacement due date"`
+	Priority string `short:"p" help:"Priority: high, medium, low, none"`
+}
+
+func (c *EditCmd) Run() error {
+	svc, err := getRemindersService()
+	if err != nil {
+		return err
+	}
+	guid, err := resolveReminderID(svc, c.ID)
+	if err != nil {
+		return err
+	}
+
+	var dueDate *time.Time
+	if c.Due != "" {
+		parsed, err := parseDueDate(c.Due)
+		if err != nil {
+			return fmt.Errorf("invalid due date: %w", err)
+		}
+		dueDate = &parsed
+	}
+	var priority *int
+	if c.Priority != "" {
+		value, err := parsePriority(c.Priority)
+		if err != nil {
+			return err
+		}
+		priority = &value
+	}
+	if dueDate == nil && priority == nil {
+		return fmt.Errorf("no changes specified; use --due or --priority")
+	}
+	changes := cloudkit.ReminderChanges{
+		DueDate: dueDate, Priority: priority,
+	}
+	if err := svc.Update(guid, changes); err != nil {
+		return fmt.Errorf("edit reminder: %w", err)
+	}
+	color.Green("✓ Updated")
+	return nil
+}
+
+func parsePriority(value string) (int, error) {
+	switch strings.ToLower(value) {
+	case "high", "h", "1":
+		return 1, nil
+	case "medium", "med", "m", "5":
+		return 5, nil
+	case "low", "l", "9":
+		return 9, nil
+	case "none", "0":
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("invalid priority %q; use high, medium, low, or none", value)
+	}
+}
+
+func resolveReminderID(svc *reminders.Service, id string) (string, error) {
+	if len(id) >= 36 {
+		return id, nil
+	}
+	items, err := svc.GetReminders("", true)
+	if err != nil {
+		return "", err
+	}
+	for _, item := range items {
+		if strings.HasPrefix(strings.ToLower(item.GUID), strings.ToLower(id)) {
+			return item.GUID, nil
+		}
+	}
+	return "", fmt.Errorf("reminder not found: %s", id)
 }
 
 // ListsCmd lists all reminder lists
@@ -227,7 +304,7 @@ func (c *LsCmd) Run() error {
 		}
 	}
 
-	reminders, err := svc.GetReminders(listGUID)
+	reminders, err := svc.GetReminders(listGUID, c.All)
 	if err != nil {
 		return fmt.Errorf("get reminders: %w", err)
 	}
@@ -258,7 +335,7 @@ func (c *LsCmd) Run() error {
 		}
 
 		fmt.Printf("  %s %s%s\n", bullet, titleColor.Sprint(r.Title), priority)
-		
+
 		// Due date
 		if r.DueDate != nil {
 			dueStr := formatDueDate(*r.DueDate)
@@ -342,13 +419,11 @@ func (c *AddCmd) Run() error {
 
 	// Parse priority
 	priority := 0
-	switch strings.ToLower(c.Priority) {
-	case "high", "h", "1":
-		priority = 1
-	case "medium", "med", "m", "5":
-		priority = 5
-	case "low", "l", "9":
-		priority = 9
+	if c.Priority != "" {
+		priority, err = parsePriority(c.Priority)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority); err != nil {
@@ -397,40 +472,6 @@ func parseDueDate(s string) (time.Time, error) {
 	}
 }
 
-// DoneCmd marks a reminder as complete
-type DoneCmd struct {
-	ID string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
-}
-
-func (c *DoneCmd) Run() error {
-	svc, err := getRemindersService()
-	if err != nil {
-		return err
-	}
-
-	// Find full GUID if partial
-	guid := c.ID
-	if len(guid) < 36 {
-		reminders, err := svc.GetReminders("")
-		if err != nil {
-			return err
-		}
-		for _, r := range reminders {
-			if strings.HasPrefix(r.GUID, guid) {
-				guid = r.GUID
-				break
-			}
-		}
-	}
-
-	if err := svc.Complete(guid); err != nil {
-		return fmt.Errorf("complete reminder: %w", err)
-	}
-
-	color.Green("✓ Marked as done")
-	return nil
-}
-
 // RmCmd deletes a reminder
 type RmCmd struct {
 	ID string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
@@ -442,19 +483,9 @@ func (c *RmCmd) Run() error {
 		return err
 	}
 
-	// Find full GUID if partial
-	guid := c.ID
-	if len(guid) < 36 {
-		reminders, err := svc.GetReminders("")
-		if err != nil {
-			return err
-		}
-		for _, r := range reminders {
-			if strings.HasPrefix(r.GUID, guid) {
-				guid = r.GUID
-				break
-			}
-		}
+	guid, err := resolveReminderID(svc, c.ID)
+	if err != nil {
+		return err
 	}
 
 	if err := svc.Delete(guid); err != nil {

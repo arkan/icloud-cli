@@ -133,35 +133,39 @@ func (c *Client) GetRecordTypes(container, env, database string, zoneID ZoneID) 
 
 // ChangesResponse is the response from zone changes
 type ChangesResponse struct {
-	Records   []Record `json:"records"`
-	SyncToken string   `json:"syncToken,omitempty"`
-	MoreComing bool    `json:"moreComing,omitempty"`
+	Records    []Record `json:"records"`
+	SyncToken  string   `json:"syncToken,omitempty"`
+	MoreComing bool     `json:"moreComing,omitempty"`
 }
 
-// FetchChanges fetches all records in a zone (initial sync)
+// FetchChanges fetches one page of changes from a custom zone.
 func (c *Client) FetchChanges(container, env, database string, zoneID ZoneID, syncToken string) (*ChangesResponse, error) {
-	path := c.buildPath(container, env, database, "records/changes")
-
-	reqBody := map[string]interface{}{
-		"zoneID":       zoneID,
-		"resultsLimit": 200,
+	path := c.buildPath(container, env, database, "changes/zone")
+	spec := ZoneChangesSpec{
+		ZoneID: zoneID,
+		DesiredKeys: []string{
+			"TitleDocument", "NotesDocument", "Name", "Completed",
+			"CompletionDate", "DueDate", "List", "Deleted", "Priority",
+			"ParentReminder", "CreationDate", "LastModifiedDate",
+		},
 	}
 	if syncToken != "" {
-		reqBody["syncToken"] = syncToken
+		spec.SyncToken = syncToken
 	}
 
-	body, err := c.request("POST", path, reqBody)
+	body, err := c.request("POST", path, ZoneChangesRequest{Zones: []ZoneChangesSpec{spec}})
 	if err != nil {
 		return nil, fmt.Errorf("fetch changes: %w", err)
 	}
 
-	// Parse the response
-	var resp ChangesResponse
+	var resp ZoneChangesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("parse changes response: %w", err)
 	}
-
-	return &resp, nil
+	if len(resp.Zones) == 0 {
+		return &ChangesResponse{}, nil
+	}
+	return &resp.Zones[0], nil
 }
 
 // LookupRecords fetches specific records by their record names

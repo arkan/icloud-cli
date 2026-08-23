@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -21,8 +25,13 @@ const (
 
 // RemindersService provides access to Reminders via CloudKit
 type RemindersService struct {
-	client *Client
-	zoneID ZoneID
+	client    *Client
+	zoneID    ZoneID
+	records   map[string]Record
+	syncToken string
+	synced    bool
+	cachePath string
+	cacheRead bool
 }
 
 // ReminderList represents a reminder list
@@ -44,49 +53,193 @@ type ReminderItem struct {
 	ModifiedDate time.Time
 }
 
+// ReminderChanges contains the fields to update. Nil pointers are unchanged.
+type ReminderChanges struct {
+	Title    *string
+	Notes    *string
+	Priority *int
+	DueDate  *time.Time
+}
+
 // NewRemindersService creates a new CloudKit-based reminders service
 func NewRemindersService(client *Client) *RemindersService {
-	return &RemindersService{
-		client: client,
-		zoneID: ZoneID{ZoneName: RemindersZone},
+	cachePath := ""
+	if home, err := os.UserHomeDir(); err == nil {
+		cachePath = filepath.Join(home, ".icloud-cli", "cloudkit-cache.json")
 	}
+	return newRemindersService(client, cachePath)
+}
+
+func newRemindersService(client *Client, cachePath string) *RemindersService {
+	return &RemindersService{
+		client:    client,
+		zoneID:    ZoneID{ZoneName: RemindersZone},
+		records:   make(map[string]Record),
+		cachePath: cachePath,
+	}
+}
+
+type remindersCache struct {
+	OwnerRecordName string            `json:"owner_record_name"`
+	SyncToken       string            `json:"sync_token"`
+	Records         map[string]Record `json:"records"`
+}
+
+func (s *RemindersService) loadCache() {
+	if s.cacheRead {
+		return
+	}
+	s.cacheRead = true
+	if s.cachePath == "" {
+		return
+	}
+	data, err := os.ReadFile(s.cachePath)
+	if err != nil {
+		return
+	}
+	var cached remindersCache
+	if json.Unmarshal(data, &cached) != nil || cached.OwnerRecordName != s.zoneID.OwnerRecordName {
+		return
+	}
+	if cached.Records != nil {
+		s.records = cached.Records
+	}
+	s.syncToken = cached.SyncToken
+}
+
+func (s *RemindersService) saveCache() error {
+	if s.cachePath == "" || s.zoneID.OwnerRecordName == "" {
+		return nil
+	}
+	directory := filepath.Dir(s.cachePath)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".cloudkit-cache-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	cache := remindersCache{
+		OwnerRecordName: s.zoneID.OwnerRecordName,
+		SyncToken:       s.syncToken,
+		Records:         s.records,
+	}
+	encoder := json.NewEncoder(temporary)
+	if err := encoder.Encode(cache); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, s.cachePath)
+}
+
+func (s *RemindersService) persistCache() {
+	if err := s.saveCache(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not save CloudKit cache: %v\n", err)
+	}
+}
+
+// ensureZone resolves the account-specific owner for the Reminders zone.
+// CloudKit custom zones must be addressed with the owner returned by zones/list;
+// guessed values such as _defaultOwner are not interchangeable with it.
+func (s *RemindersService) ensureZone() error {
+	if s.zoneID.OwnerRecordName != "" {
+		s.loadCache()
+		return nil
+	}
+	zones, err := s.client.ListZones(RemindersContainer, RemindersEnv, RemindersDB)
+	if err != nil {
+		return fmt.Errorf("resolve reminders zone: %w", err)
+	}
+	for _, zone := range zones.Zones {
+		if zone.ZoneID.ZoneName == RemindersZone && zone.ZoneID.OwnerRecordName != "" {
+			s.zoneID = zone.ZoneID
+			s.loadCache()
+			return nil
+		}
+	}
+	return fmt.Errorf("reminders zone not found")
+}
+
+// Sync refreshes the in-memory record cache using CloudKit delta tokens.
+// A forced sync discards the existing token and rebuilds the cache.
+func (s *RemindersService) Sync(force bool) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	if force {
+		s.records = make(map[string]Record)
+		s.syncToken = ""
+		s.synced = false
+	}
+	if s.synced {
+		return nil
+	}
+
+	token := s.syncToken
+	for {
+		resp, err := s.client.FetchChanges(
+			RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, token,
+		)
+		if err != nil {
+			return fmt.Errorf("fetch reminders changes: %w", err)
+		}
+		for _, record := range resp.Records {
+			if record.Deleted || isSoftDeleted(record) {
+				delete(s.records, record.RecordName)
+				continue
+			}
+			s.records[record.RecordName] = record
+		}
+		previousToken := token
+		if resp.SyncToken != "" {
+			token = resp.SyncToken
+			s.syncToken = resp.SyncToken
+		}
+		if resp.MoreComing && (resp.SyncToken == "" || token == previousToken) {
+			return fmt.Errorf("fetch reminders changes: pagination did not advance sync token")
+		}
+		if !resp.MoreComing {
+			break
+		}
+	}
+	s.synced = true
+	s.persistCache()
+	return nil
+}
+
+func isSoftDeleted(record Record) bool {
+	field, ok := record.Fields["Deleted"]
+	return ok && fieldBool(field.Value)
 }
 
 // GetReminders fetches all reminders from CloudKit
 func (s *RemindersService) GetReminders(includeCompleted bool) ([]ReminderItem, error) {
-	var allRecords []Record
-	var syncToken string
-
-	// Fetch all records (may need multiple requests due to pagination)
-	for {
-		resp, err := s.client.FetchChanges(
-			RemindersContainer, RemindersEnv, RemindersDB,
-			s.zoneID, syncToken,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("fetch reminders: %w", err)
-		}
-
-		allRecords = append(allRecords, resp.Records...)
-
-		if !resp.MoreComing {
-			break
-		}
-		syncToken = resp.SyncToken
+	if err := s.Sync(false); err != nil {
+		return nil, err
 	}
 
 	// Convert to ReminderItems
 	var reminders []ReminderItem
-	for _, r := range allRecords {
+	for _, r := range s.records {
 		if r.RecordType != "Reminder" || r.Deleted {
 			continue
 		}
 
-		// Check soft-delete flag in Fields
-		if f, ok := r.Fields["Deleted"]; ok {
-			if v, ok := f.Value.(float64); ok && v == 1 {
-				continue
-			}
+		if isSoftDeleted(r) {
+			continue
 		}
 
 		item := s.parseReminder(r)
@@ -104,64 +257,52 @@ func (s *RemindersService) GetReminders(includeCompleted bool) ([]ReminderItem, 
 
 // GetLists fetches all reminder lists from CloudKit
 func (s *RemindersService) GetLists() ([]ReminderList, error) {
-	var allRecords []Record
-	var syncToken string
-
-	// Fetch all records
-	for {
-		resp, err := s.client.FetchChanges(
-			RemindersContainer, RemindersEnv, RemindersDB,
-			s.zoneID, syncToken,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("fetch lists: %w", err)
-		}
-
-		allRecords = append(allRecords, resp.Records...)
-
-		if !resp.MoreComing {
-			break
-		}
-		syncToken = resp.SyncToken
+	if err := s.Sync(false); err != nil {
+		return nil, err
 	}
 
-	// Find unique list IDs from Reminder records
+	listRecords := make(map[string]Record)
 	listIDs := make(map[string]bool)
-	for _, r := range allRecords {
-		if r.RecordType == "Reminder" && r.Parent != nil {
-			listIDs[r.Parent.RecordName] = true
+	for _, r := range s.records {
+		switch r.RecordType {
+		case "ReminderList", "List":
+			listIDs[r.RecordName] = true
+			listRecords[r.RecordName] = r
+		case "Reminder":
+			if listID := recordListID(r); listID != "" {
+				listIDs[listID] = true
+			}
 		}
 	}
 
 	// Collect list record names for lookup
 	var listRecordNames []string
 	for listID := range listIDs {
-		listRecordNames = append(listRecordNames, listID)
+		if _, exists := listRecords[listID]; !exists {
+			listRecordNames = append(listRecordNames, listID)
+		}
 	}
 
 	// Lookup list records to get their names
-	listRecords := make(map[string]Record)
 	if len(listRecordNames) > 0 {
 		resp, err := s.client.LookupRecords(
 			RemindersContainer, RemindersEnv, RemindersDB,
 			s.zoneID, listRecordNames,
 		)
-		if err == nil {
-			for _, r := range resp.Records {
-				listRecords[r.RecordName] = r
+		if err != nil {
+			return nil, fmt.Errorf("lookup reminder lists: %w", err)
+		}
+		for _, r := range resp.Records {
+			if err := recordError(r); err != nil {
+				return nil, fmt.Errorf("lookup reminder list %s: %w", r.RecordName, err)
 			}
+			listRecords[r.RecordName] = r
 		}
 	}
 
 	// Build list results
 	var lists []ReminderList
 	for listID := range listIDs {
-		parts := strings.Split(listID, "/")
-		uuid := listID
-		if len(parts) == 2 {
-			uuid = parts[1]
-		}
-
 		title := ""
 		if r, ok := listRecords[listID]; ok {
 			// Extract Name field directly (it's stored in plain text)
@@ -172,10 +313,10 @@ func (s *RemindersService) GetLists() ([]ReminderList, error) {
 			}
 		}
 		if title == "" {
-			title = "List " + uuid[:8]
+			title = "List " + listID[:min(8, len(listID))]
 		}
 
-		lists = append(lists, ReminderList{ID: uuid, Title: title})
+		lists = append(lists, ReminderList{ID: listID, Title: title})
 	}
 
 	return lists, nil
@@ -187,24 +328,14 @@ func (s *RemindersService) parseReminder(r Record) ReminderItem {
 		ID: r.RecordName,
 	}
 
-	// Extract list ID from parent reference
-	if r.Parent != nil {
-		parts := strings.Split(r.Parent.RecordName, "/")
-		if len(parts) == 2 {
-			item.ListID = parts[1]
-		} else {
-			item.ListID = r.Parent.RecordName
-		}
-	}
+	item.ListID = recordListID(r)
 
 	// Decode title
 	item.Title = s.decodeTitle(r)
 
 	// Get other fields
 	if f, ok := r.Fields["Completed"]; ok {
-		if v, ok := f.Value.(float64); ok {
-			item.Completed = v == 1
-		}
+		item.Completed = fieldBool(f.Value)
 	}
 
 	if f, ok := r.Fields["Priority"]; ok {
@@ -243,6 +374,65 @@ func (s *RemindersService) parseReminder(r Record) ReminderItem {
 	}
 
 	return item
+}
+
+func fieldBool(value interface{}) bool {
+	switch value := value.(type) {
+	case bool:
+		return value
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	case int64:
+		return value != 0
+	default:
+		return false
+	}
+}
+
+func recordListID(record Record) string {
+	if field, ok := record.Fields["List"]; ok {
+		switch value := field.Value.(type) {
+		case RecordReference:
+			return value.RecordName
+		case *RecordReference:
+			if value != nil {
+				return value.RecordName
+			}
+		case map[string]interface{}:
+			if name, ok := value["recordName"].(string); ok {
+				return name
+			}
+		}
+	}
+	if record.Parent != nil {
+		return record.Parent.RecordName
+	}
+	return ""
+}
+
+func mergeRecord(base, update Record) Record {
+	if update.RecordName != "" {
+		base.RecordName = update.RecordName
+	}
+	if update.RecordType != "" {
+		base.RecordType = update.RecordType
+	}
+	if update.RecordChangeTag != "" {
+		base.RecordChangeTag = update.RecordChangeTag
+	}
+	if base.Fields == nil {
+		base.Fields = make(map[string]FieldValue)
+	}
+	for name, value := range update.Fields {
+		base.Fields[name] = value
+	}
+	if update.Parent != nil {
+		base.Parent = update.Parent
+	}
+	base.Deleted = update.Deleted
+	return base
 }
 
 // decodeTitle extracts the title from a record's TitleDocument field
@@ -289,50 +479,105 @@ func decodeGzipBase64(s string) string {
 	return string(decompressed)
 }
 
-// encodeGzipBase64 encodes a string with gzip compression and base64
-func encodeGzipBase64(s string) (string, error) {
-	var buf bytes.Buffer
-	writer := gzip.NewWriter(&buf)
-	if _, err := writer.Write([]byte(s)); err != nil {
-		return "", err
+func encodeVarint(value uint64) []byte {
+	var encoded []byte
+	for value > 127 {
+		encoded = append(encoded, byte(value&0x7f)|0x80)
+		value >>= 7
 	}
-	if err := writer.Close(); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+	return append(encoded, byte(value))
 }
 
-// encodeTitleDocument encodes a title into the protobuf format used by CloudKit
-// Format: \x12 + length (varint) + UTF-8 string
-func encodeTitleDocument(title string) (string, error) {
-	// Simple protobuf encoding: field 2, wire type 2 (length-delimited)
-	// Full format includes some header bytes that Apple uses
-	titleBytes := []byte(title)
-	length := len(titleBytes)
-
-	var data []byte
-	// Add a minimal header (observed from real data)
-	data = append(data, 0x0a, 0x00) // field 1, empty
-
-	// Field 2: the title
-	data = append(data, 0x12) // field 2, wire type 2
-	if length < 128 {
-		data = append(data, byte(length))
-	} else {
-		// Varint encoding for lengths >= 128
-		data = append(data, byte(length&0x7f|0x80), byte(length>>7))
+func encodeField(number, wireType int, value interface{}) []byte {
+	tag := byte(number<<3 | wireType)
+	switch wireType {
+	case 0:
+		return append([]byte{tag}, encodeVarint(value.(uint64))...)
+	case 2:
+		data := value.([]byte)
+		result := append([]byte{tag}, encodeVarint(uint64(len(data)))...)
+		return append(result, data...)
+	default:
+		panic("unsupported protobuf wire type")
 	}
-	data = append(data, titleBytes...)
+}
 
-	return encodeGzipBase64(string(data))
+func encodePosition(replica uint64, offset int64) []byte {
+	result := encodeField(1, 0, replica)
+	if offset == -1 {
+		return append(result, encodeField(2, 0, uint64(0xffffffff))...)
+	}
+	return append(result, encodeField(2, 0, uint64(offset))...)
+}
+
+// encodeTitleDocument encodes Apple's Reminders CRDT document format.
+// Character counts deliberately use Unicode code points rather than UTF-8 bytes.
+func encodeTitleDocument(title string) (string, error) {
+	titleBytes := []byte(title)
+	charLength := uint64(utf8.RuneCountInString(title))
+
+	op1 := encodeField(1, 2, encodePosition(0, 0))
+	op1 = append(op1, encodeField(2, 0, uint64(0))...)
+	op1 = append(op1, encodeField(3, 2, encodePosition(0, 0))...)
+	op1 = append(op1, encodeField(5, 0, uint64(1))...)
+
+	op2 := encodeField(1, 2, encodePosition(1, 0))
+	op2 = append(op2, encodeField(2, 0, charLength)...)
+	op2 = append(op2, encodeField(3, 2, encodePosition(1, 0))...)
+	op2 = append(op2, encodeField(5, 0, uint64(2))...)
+
+	op3 := encodeField(1, 2, encodePosition(0, -1))
+	op3 = append(op3, encodeField(2, 0, uint64(0))...)
+	op3 = append(op3, encodeField(3, 2, encodePosition(0, -1))...)
+
+	documentUUID, err := uuid.NewRandom()
+	if err != nil {
+		return "", fmt.Errorf("generate document UUID: %w", err)
+	}
+	clock := encodeField(1, 0, charLength)
+	replica := encodeField(1, 0, uint64(1))
+	uuidEntry := encodeField(1, 2, documentUUID[:])
+	uuidEntry = append(uuidEntry, encodeField(2, 2, clock)...)
+	uuidEntry = append(uuidEntry, encodeField(2, 2, replica)...)
+	metadata := encodeField(1, 2, uuidEntry)
+
+	note := encodeField(2, 2, titleBytes)
+	note = append(note, encodeField(3, 2, op1)...)
+	note = append(note, encodeField(3, 2, op2)...)
+	note = append(note, encodeField(3, 2, op3)...)
+	note = append(note, encodeField(4, 2, metadata)...)
+	note = append(note, encodeField(5, 2, encodeField(1, 0, charLength))...)
+
+	document := encodeField(1, 0, uint64(0))
+	document = append(document, encodeField(2, 0, uint64(0))...)
+	document = append(document, encodeField(3, 2, note)...)
+	outer := encodeField(1, 0, uint64(0))
+	outer = append(outer, encodeField(2, 2, document)...)
+
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(outer); err != nil {
+		return "", fmt.Errorf("compress document: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("close document compressor: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(compressed.Bytes()), nil
 }
 
 // extractReadableText tries to extract readable text from protobuf-encoded data
 func extractReadableText(s string) string {
-	// The decoded content is a protobuf where field 2 contains the title
-	// Format: \x12 + length byte(s) + UTF-8 string
 	data := []byte(s)
+	// Reminders CRDT documents nest the user text as outer.2 -> document.3 -> note.2.
+	if outer, ok := protobufBytesField(data, 2); ok {
+		if document, ok := protobufBytesField(outer, 3); ok {
+			if text, ok := protobufBytesField(document, 2); ok && utf8.Valid(text) {
+				return strings.TrimSpace(string(text))
+			}
+		}
+	}
 
+	// Keep a permissive fallback for older TitleDocument variants.
 	// Look for field 2 marker (\x12 = field 2, wire type 2 = length-delimited)
 	for i := 0; i < len(data)-2; i++ {
 		if data[i] == 0x12 {
@@ -387,11 +632,63 @@ func extractReadableText(s string) string {
 	return strings.TrimSpace(result.String())
 }
 
+func protobufBytesField(message []byte, wanted int) ([]byte, bool) {
+	for offset := 0; offset < len(message); {
+		tag, bytesRead := decodeVarint(message[offset:])
+		if bytesRead == 0 {
+			return nil, false
+		}
+		offset += bytesRead
+		fieldNumber := int(tag >> 3)
+		wireType := int(tag & 7)
+		switch wireType {
+		case 0:
+			_, bytesRead = decodeVarint(message[offset:])
+			if bytesRead == 0 {
+				return nil, false
+			}
+			offset += bytesRead
+		case 2:
+			length, lengthBytes := decodeVarint(message[offset:])
+			if lengthBytes == 0 {
+				return nil, false
+			}
+			offset += lengthBytes
+			end := offset + int(length)
+			if end < offset || end > len(message) {
+				return nil, false
+			}
+			if fieldNumber == wanted {
+				return message[offset:end], true
+			}
+			offset = end
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+func decodeVarint(data []byte) (uint64, int) {
+	var value uint64
+	for i, current := range data {
+		if i == 10 || i == 9 && current > 1 {
+			return 0, 0
+		}
+		value |= uint64(current&0x7f) << (7 * i)
+		if current < 0x80 {
+			return value, i + 1
+		}
+	}
+	return 0, 0
+}
+
 // AddReminder creates a new reminder in CloudKit
 func (s *RemindersService) AddReminder(title, notes, listID string, priority int, dueDate *time.Time) (*ReminderItem, error) {
-	// Generate new UUID for the reminder
-	reminderID := uuid.New().String()
-	recordName := "Reminder/" + reminderID
+	if err := s.ensureZone(); err != nil {
+		return nil, err
+	}
+	recordName := strings.ToUpper(uuid.New().String())
 
 	// Encode the title
 	titleDoc, err := encodeTitleDocument(title)
@@ -399,38 +696,14 @@ func (s *RemindersService) AddReminder(title, notes, listID string, priority int
 		return nil, fmt.Errorf("encode title: %w", err)
 	}
 
-	now := time.Now().UnixMilli()
-
-	// Build the record
 	fields := map[string]FieldValue{
-		"TitleDocument": {
-			Value: titleDoc,
-			Type:  "ENCRYPTED_BYTES",
-		},
-		"CreationDate": {
-			Value: now,
-			Type:  "TIMESTAMP",
-		},
-		"LastModifiedDate": {
-			Value: now,
-			Type:  "TIMESTAMP",
-		},
-		"Priority": {
-			Value: priority,
-			Type:  "NUMBER_INT64",
-		},
-		"Completed": {
-			Value: 0,
-			Type:  "NUMBER_INT64",
-		},
+		"TitleDocument": {Value: titleDoc},
+		"Completed":     {Value: 0},
 	}
 
 	// Add due date if provided
 	if dueDate != nil {
-		fields["DueDate"] = FieldValue{
-			Value: dueDate.UnixMilli(),
-			Type:  "TIMESTAMP",
-		}
+		fields["DueDate"] = FieldValue{Value: dueDate.UnixMilli()}
 	}
 
 	// Add notes if provided
@@ -439,46 +712,26 @@ func (s *RemindersService) AddReminder(title, notes, listID string, priority int
 		if err != nil {
 			return nil, fmt.Errorf("encode notes: %w", err)
 		}
-		fields["NotesDocument"] = FieldValue{
-			Value: notesDoc,
-			Type:  "ENCRYPTED_BYTES",
-		}
+		fields["NotesDocument"] = FieldValue{Value: notesDoc}
 	}
-
-	// Format list reference
-	listRecordName := listID
-	if !strings.HasPrefix(listID, "List/") {
-		listRecordName = "List/" + listID
+	if priority != 0 {
+		fields["Priority"] = FieldValue{Value: priority}
 	}
-
-	// Add list reference
-	fields["List"] = FieldValue{
-		Value: map[string]interface{}{
-			"recordName": listRecordName,
-			"action":     "VALIDATE",
-			"zoneID": map[string]interface{}{
-				"zoneName":        RemindersZone,
-				"ownerRecordName": "_defaultOwner",
-				"zoneType":        "REGULAR_CUSTOM_ZONE",
-			},
-		},
-		Type: "REFERENCE",
+	if listID != "" {
+		fields["List"] = FieldValue{Value: RecordReference{RecordName: listID, Action: "NONE"}}
 	}
 
 	record := Record{
 		RecordName: recordName,
 		RecordType: "Reminder",
 		Fields:     fields,
-		Parent: &RecordReference{
-			RecordName: listRecordName,
-		},
 	}
 
 	req := ModifyRequest{
 		ZoneID: s.zoneID,
 		Operations: []RecordOperation{
 			{
-				OperationType: "create",
+				OperationType: OperationCreate,
 				Record:        record,
 			},
 		},
@@ -495,136 +748,125 @@ func (s *RemindersService) AddReminder(title, notes, listID string, priority int
 	if len(resp.Records) == 0 {
 		return nil, fmt.Errorf("no record returned from create")
 	}
+	if err := recordError(resp.Records[0]); err != nil {
+		return nil, fmt.Errorf("create reminder: %w", err)
+	}
+	s.records[recordName] = mergeRecord(record, resp.Records[0])
+	s.persistCache()
 
 	// Return the created reminder
 	item := s.parseReminder(resp.Records[0])
 	return &item, nil
 }
 
-// CompleteReminder marks a reminder as done
-func (s *RemindersService) CompleteReminder(reminderID string) error {
-	// Format record name
-	recordName := reminderID
-	if !strings.HasPrefix(reminderID, "Reminder/") {
-		recordName = "Reminder/" + reminderID
+// UpdateReminder applies a partial update using CloudKit optimistic locking.
+func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderChanges) error {
+	if changes.Title != nil || changes.Notes != nil {
+		return fmt.Errorf("updating reminder title or notes is not supported: CloudKit accepts the request but discards the replacement CRDT document")
 	}
-
-	// First, lookup the existing record to get the change tag
-	resp, err := s.client.LookupRecords(
-		RemindersContainer, RemindersEnv, RemindersDB,
-		s.zoneID, []string{recordName},
-	)
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	existing, err := s.lookupReminder(reminderID)
 	if err != nil {
-		return fmt.Errorf("lookup reminder: %w", err)
+		return err
+	}
+	fields := make(map[string]FieldValue)
+	if changes.Priority != nil {
+		fields["Priority"] = FieldValue{Value: *changes.Priority}
+	}
+	if changes.DueDate != nil {
+		fields["DueDate"] = FieldValue{Value: changes.DueDate.UnixMilli()}
+	}
+	if len(fields) == 0 {
+		return fmt.Errorf("no reminder changes specified")
 	}
 
-	if len(resp.Records) == 0 {
-		return fmt.Errorf("reminder not found: %s", reminderID)
-	}
-
-	existingRecord := resp.Records[0]
-	now := time.Now().UnixMilli()
-
-	// Update the record
-	record := Record{
-		RecordName:      recordName,
-		RecordType:      "Reminder",
-		RecordChangeTag: existingRecord.RecordChangeTag,
-		Fields: map[string]FieldValue{
-			"Completed": {
-				Value: 1,
-				Type:  "NUMBER_INT64",
-			},
-			"CompletionDate": {
-				Value: now,
-				Type:  "TIMESTAMP",
-			},
-			"LastModifiedDate": {
-				Value: now,
-				Type:  "TIMESTAMP",
-			},
-		},
-	}
-
-	req := ModifyRequest{
+	request := ModifyRequest{
 		ZoneID: s.zoneID,
-		Operations: []RecordOperation{
-			{
-				OperationType: "update",
-				Record:        record,
+		Operations: []RecordOperation{{
+			OperationType: OperationUpdate,
+			Record: Record{
+				RecordName:      reminderID,
+				RecordType:      "Reminder",
+				RecordChangeTag: existing.RecordChangeTag,
+				Fields:          fields,
 			},
-		},
+		}},
 	}
-
-	_, err = s.client.ModifyRecords(
-		RemindersContainer, RemindersEnv, RemindersDB,
-		req,
-	)
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, request)
 	if err != nil {
 		return fmt.Errorf("update reminder: %w", err)
 	}
-
+	if len(response.Records) == 0 {
+		return fmt.Errorf("update reminder: no record returned")
+	}
+	if err := recordError(response.Records[0]); err != nil {
+		return fmt.Errorf("update reminder: %w", err)
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
 	return nil
 }
 
-// DeleteReminder soft-deletes a reminder (moves to recently deleted)
-func (s *RemindersService) DeleteReminder(reminderID string) error {
-	// Format record name
-	recordName := reminderID
-	if !strings.HasPrefix(reminderID, "Reminder/") {
-		recordName = "Reminder/" + reminderID
-	}
-
-	// Lookup the existing record to get the change tag
-	resp, err := s.client.LookupRecords(
-		RemindersContainer, RemindersEnv, RemindersDB,
-		s.zoneID, []string{recordName},
+func (s *RemindersService) lookupReminder(reminderID string) (Record, error) {
+	response, err := s.client.LookupRecords(
+		RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, []string{reminderID},
 	)
 	if err != nil {
-		return fmt.Errorf("lookup reminder: %w", err)
+		return Record{}, fmt.Errorf("lookup reminder: %w", err)
 	}
-
-	if len(resp.Records) == 0 {
-		return fmt.Errorf("reminder not found: %s", reminderID)
+	if len(response.Records) == 0 {
+		return Record{}, fmt.Errorf("reminder not found: %s", reminderID)
 	}
+	if err := recordError(response.Records[0]); err != nil {
+		return Record{}, fmt.Errorf("lookup reminder: %w", err)
+	}
+	if response.Records[0].RecordChangeTag == "" {
+		return Record{}, fmt.Errorf("reminder %s has no change tag", reminderID)
+	}
+	return response.Records[0], nil
+}
 
-	existingRecord := resp.Records[0]
-	now := time.Now().UnixMilli()
-
-	// Soft delete by setting Deleted field to 1
+// DeleteReminder deletes a reminder through CloudKit's native delete operation.
+func (s *RemindersService) DeleteReminder(reminderID string) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	existingRecord, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
 	record := Record{
-		RecordName:      recordName,
-		RecordType:      "Reminder",
+		RecordName:      reminderID,
 		RecordChangeTag: existingRecord.RecordChangeTag,
-		Fields: map[string]FieldValue{
-			"Deleted": {
-				Value: 1,
-				Type:  "NUMBER_INT64",
-			},
-			"LastModifiedDate": {
-				Value: now,
-				Type:  "TIMESTAMP",
-			},
-		},
 	}
 
 	req := ModifyRequest{
 		ZoneID: s.zoneID,
 		Operations: []RecordOperation{
 			{
-				OperationType: "update",
+				OperationType: OperationDelete,
 				Record:        record,
 			},
 		},
 	}
 
-	_, err = s.client.ModifyRecords(
+	modified, err := s.client.ModifyRecords(
 		RemindersContainer, RemindersEnv, RemindersDB,
 		req,
 	)
 	if err != nil {
 		return fmt.Errorf("delete reminder: %w", err)
 	}
+	if len(modified.Records) == 0 {
+		return fmt.Errorf("delete reminder: no record returned")
+	}
+	if err := recordError(modified.Records[0]); err != nil {
+		return fmt.Errorf("delete reminder: %w", err)
+	}
+	delete(s.records, reminderID)
+	s.persistCache()
 
 	return nil
 }

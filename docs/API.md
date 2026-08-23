@@ -73,7 +73,20 @@ null
 
 Returns session info and webservices if valid.
 
-#### 4. 2FA Verification
+#### 4. Trigger the 2FA notification
+
+Apple's current authentication flow requires an explicit push trigger before
+the code is displayed on trusted devices:
+
+```http
+PUT https://idmsa.apple.com/appleauth/auth/verify/trusteddevice/securitycode
+```
+
+The request has no body and includes the current `scnt` and
+`X-Apple-ID-Session-Id` headers. HTTP `204` indicates that the trigger was
+accepted; `200` and `202` are retained for compatibility with older behavior.
+
+#### 5. Verify the 2FA code
 ```
 POST https://idmsa.apple.com/appleauth/auth/verify/trusteddevice/securitycode
 Content-Type: application/json
@@ -87,7 +100,7 @@ Content-Type: application/json
 
 **Required Headers:** Same as sign-in + `scnt` + `X-Apple-ID-Session-Id`
 
-#### 5. Trust Session
+#### 6. Trust Session
 ```
 GET https://idmsa.apple.com/appleauth/auth/2sv/trust
 ```
@@ -96,108 +109,127 @@ GET https://idmsa.apple.com/appleauth/auth/2sv/trust
 
 ---
 
-## Reminders API
+## Reminders CloudKit API
 
-### Get All Reminders and Lists
-```
-GET https://<reminders_service_url>/rd/startup
-```
+The authenticated `ckdatabasews` URL from the account-login response is used as
+the base. All calls target container `com.apple.reminders`, environment
+`production`, database `private`, and custom zone `Reminders`.
 
-**Query Params:**
-- `clientVersion=4.0`
-- `lang=en-us`
-- `usertz=Europe/Paris`
-- `dsid=<dsid>` (from webservices)
+This is an undocumented Apple service. The examples describe observed behavior,
+not a stable public contract.
 
-**Response:**
-```json
-{
-  "Collections": [
-    {
-      "guid": "tasks",
-      "title": "Reminders",
-      "ctag": "...",
-      "order": 1
-    }
-  ],
-  "Reminders": [
-    {
-      "guid": "reminder-uuid",
-      "pGuid": "tasks",
-      "title": "Buy milk",
-      "description": "",
-      "priority": 0,
-      "dueDate": [20260125, 2026, 1, 25, 14, 30],
-      "completedDate": null,
-      "createdDateExtended": 1706123456789
-    }
-  ]
-}
+### Resolve the zone owner
+
+```http
+POST /database/1/com.apple.reminders/production/private/zones/list
 ```
 
-### Create Reminder
-```
-POST https://<reminders_service_url>/rd/reminders/tasks
+Select the zone named `Reminders` and preserve its `ownerRecordName`. Every
+subsequent zone request must use that exact pair.
+
+### Fetch zone changes
+
+```http
+POST /database/1/com.apple.reminders/production/private/changes/zone
 Content-Type: application/json
 
 {
-  "Reminders": {
-    "title": "New reminder",
-    "description": "",
-    "pGuid": "tasks",
-    "etag": null,
-    "order": null,
-    "priority": 0,
-    "recurrence": null,
-    "alarms": [],
-    "startDate": null,
-    "startDateTz": null,
-    "startDateIsAllDay": false,
-    "completedDate": null,
-    "dueDate": [20260125, 2026, 1, 25, 14, 30],
-    "dueDateIsAllDay": false,
-    "lastModifiedDate": null,
-    "createdDate": null,
-    "isFamily": null,
-    "createdDateExtended": 1706123456789,
-    "guid": "<new-uuid>"
+  "zones": [{
+    "zoneID": {
+      "zoneName": "Reminders",
+      "ownerRecordName": "<owner>"
+    },
+    "desiredKeys": [
+      "TitleDocument", "NotesDocument", "Name", "Completed",
+      "CompletionDate", "DueDate", "List", "Deleted", "Priority",
+      "ParentReminder", "CreationDate", "LastModifiedDate"
+    ],
+    "syncToken": "<previous-token>"
+  }]
+}
+```
+
+The response contains one entry in `zones`, with `records`, `syncToken`, and
+`moreComing`. Continue paging while `moreComing` is true. Preserve full record
+names and `recordChangeTag` values exactly as returned.
+
+### Create a reminder
+
+```http
+POST /database/1/com.apple.reminders/production/private/records/modify
+Content-Type: application/json
+
+{
+  "zoneID": {
+    "zoneName": "Reminders",
+    "ownerRecordName": "<owner>"
   },
-  "ClientState": {
-    "Collections": [{"guid": "tasks", "ctag": "..."}]
+  "operations": [{
+    "operationType": "create",
+    "record": {
+      "recordType": "Reminder",
+      "recordName": "<UPPERCASE-UUID>",
+      "fields": {
+        "TitleDocument": {"value": "<base64-gzip-crdt>"},
+        "Completed": {"value": 0},
+        "List": {"value": {
+          "recordName": "<exact-list-record-name>",
+          "action": "NONE"
+        }}
+      }
+    }
+  }]
+}
+```
+
+`TitleDocument` and `NotesDocument` use the Reminders CRDT protobuf structure;
+they are not plain strings and do not use the legacy minimal protobuf encoding.
+Do not invent `Reminder/` or `List/` prefixes and do not force CloudKit field
+types in the request.
+
+### Update scalar fields
+
+First use `records/lookup` to obtain the current `recordChangeTag`, then send an
+`update` operation containing only the changed fields:
+
+```json
+{
+  "operationType": "update",
+  "record": {
+    "recordType": "Reminder",
+    "recordName": "<exact-record-name>",
+    "recordChangeTag": "<current-change-tag>",
+    "fields": {
+      "Priority": {"value": 5},
+      "DueDate": {"value": 1787487524290}
+    }
   }
 }
 ```
 
-### Complete Reminder
-```
-POST https://<reminders_service_url>/rd/reminders/tasks
-Content-Type: application/json
+Priority and due-date updates are live-tested. Title and notes replacements are
+not supported: the server accepts a newly encoded CRDT snapshot but later
+reconciles the old text back into the record.
 
+Completion is also not supported: live tests show CloudKit reconciling both
+`Completed` and `CompletionDate` updates back to the incomplete state.
+
+### Delete a reminder
+
+Use the native operation and current change tag:
+
+```json
 {
-  "Reminders": {
-    "guid": "<reminder-guid>",
-    "pGuid": "<list-guid>",
-    "completedDate": [20260125, 2026, 1, 25, 14, 30],
-    ...other fields...
-  },
-  "ClientState": {...}
+  "operationType": "delete",
+  "record": {
+    "recordName": "<exact-record-name>",
+    "recordChangeTag": "<current-change-tag>"
+  }
 }
 ```
 
-### Delete Reminder
-```
-POST https://<reminders_service_url>/rd/reminders/tasks
-Content-Type: application/json
-
-{
-  "Reminders": {
-    "guid": "<reminder-guid>",
-    "pGuid": "<list-guid>",
-    "deleted": true
-  },
-  "ClientState": {...}
-}
-```
+Every entry in a `records/modify` response must be inspected for
+`serverErrorCode` and `reason`; an HTTP 200 alone does not prove success.
 
 ---
 
