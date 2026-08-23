@@ -134,6 +134,14 @@ func (s *Service) Update(reminderGUID string, changes cloudkit.ReminderChanges) 
 	return nil
 }
 
+// Complete submits a completion mutation via CloudKit.
+func (s *Service) Complete(reminderGUID string) error {
+	if err := s.cloudkitSvc.CompleteReminder(reminderGUID); err != nil {
+		return fmt.Errorf("complete reminder: %w", err)
+	}
+	return nil
+}
+
 // Delete removes a reminder via CloudKit.
 func (s *Service) Delete(reminderGUID string) error {
 	if err := s.cloudkitSvc.DeleteReminder(reminderGUID); err != nil {

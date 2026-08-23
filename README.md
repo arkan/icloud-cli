@@ -15,7 +15,8 @@ CloudKit web service used by iCloud.com.
 - Persistent authenticated sessions
 - List and search reminders and lists
 - Add reminders with notes, due dates, and priorities
-- Edit due dates and priorities
+- Edit titles, notes, due dates, and priorities (text updates are experimental)
+- Mark reminders complete (experimental)
 - Delete reminders
 - CloudKit delta synchronization with optimistic locking
 
@@ -48,7 +49,9 @@ icloud reminders ls "Shopping"
 # Create and mutate reminders
 icloud reminders add "Buy milk" -l "Shopping"
 icloud reminders add "Call mom" --due "tomorrow 14:00" --priority high
+icloud reminders edit ABC12345 --title "Buy oat milk" --description "Experimental"
 icloud reminders edit ABC12345 --due "2026-09-01" --priority medium
+icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
 
@@ -103,13 +106,14 @@ and renders correctly. A dedicated test account is recommended.
 - The CloudKit API and Reminders CRDT format are undocumented.
 - Live behavior may differ with Advanced Data Protection, shared lists, or
   future Apple server changes.
-- Editing a title or notes is not supported. Live tests show that CloudKit
-  accepts a replacement CRDT document but reconciles it back to the previous
-  text. The reference project currently uses that same unverified replacement
-  strategy. Priority and due-date updates are supported.
+- Editing a title or notes is experimental. CloudKit accepts the replacement
+  CRDT document, but live tests on one account reconciled it back to the
+  previous text. The command is exposed for accounts where that private API
+  behavior differs. Priority and due-date updates are verified.
 - Clearing an existing due date is not yet exposed by the CLI.
-- Marking a reminder complete is not supported. Both `Completed` and
-  `CompletionDate` updates are accepted and then reconciled back by CloudKit.
+- Marking a reminder complete is experimental. CloudKit accepted the numeric
+  `Completed` and `CompletionDate` fields but reconciled them back on one live
+  account.
 - The local CloudKit cache contains reminder metadata and is specific to the
   authenticated zone owner. Remove it to force a full resynchronization.
 

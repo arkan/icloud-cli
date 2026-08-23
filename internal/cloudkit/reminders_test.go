@@ -153,14 +153,18 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 	}
 	service := newRemindersService(client, "")
 	priority := 5
-	if err := service.UpdateReminder("ABC-123", ReminderChanges{Priority: &priority}); err != nil {
+	title := "Experimental edit"
+	if err := service.UpdateReminder("ABC-123", ReminderChanges{Title: &title, Priority: &priority}); err != nil {
 		t.Fatalf("UpdateReminder: %v", err)
+	}
+	if err := service.CompleteReminder("ABC-123"); err != nil {
+		t.Fatalf("CompleteReminder: %v", err)
 	}
 	if err := service.DeleteReminder("ABC-123"); err != nil {
 		t.Fatalf("DeleteReminder: %v", err)
 	}
 
-	if len(operations) != 2 {
+	if len(operations) != 3 {
 		t.Fatalf("operations = %#v", operations)
 	}
 	edit := operations[0]
@@ -170,26 +174,20 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 	if edit.Record.Fields["Priority"].Value != float64(priority) {
 		t.Errorf("priority field = %#v", edit.Record.Fields["Priority"])
 	}
-	deleteOp := operations[1]
-	if deleteOp.OperationType != "delete" || deleteOp.Record.RecordName != "ABC-123" || deleteOp.Record.RecordChangeTag != "change-8" {
+	assertCRDTDocumentContains(t, edit.Record.Fields["TitleDocument"].Value.(string), title)
+	complete := operations[1]
+	if complete.Record.Fields["Completed"].Value != float64(1) {
+		t.Errorf("complete fields = %#v", complete.Record.Fields)
+	}
+	deleteOp := operations[2]
+	if deleteOp.OperationType != "delete" || deleteOp.Record.RecordName != "ABC-123" || deleteOp.Record.RecordChangeTag != "change-9" {
 		t.Errorf("delete operation = %#v", deleteOp)
 	}
 	if len(deleteOp.Record.Fields) != 0 {
 		t.Errorf("delete should not emulate a soft deletion: %#v", deleteOp.Record.Fields)
 	}
-	if lookupCount != 2 {
+	if lookupCount != 3 {
 		t.Errorf("lookup count = %d, want a fresh change tag for every mutation", lookupCount)
-	}
-}
-
-func TestUpdateReminderRejectsTextChanges(t *testing.T) {
-	t.Parallel()
-
-	service := newRemindersService(nil, "")
-	title := "not silently ignored"
-	err := service.UpdateReminder("ABC-123", ReminderChanges{Title: &title})
-	if err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("UpdateReminder error = %v", err)
 	}
 }
 

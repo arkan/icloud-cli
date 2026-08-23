@@ -165,14 +165,17 @@ type RemindersCmd struct {
 	Ls    LsCmd    `cmd:"" help:"List reminders"`
 	Add   AddCmd   `cmd:"" help:"Add a new reminder"`
 	Edit  EditCmd  `cmd:"" help:"Edit a reminder"`
+	Done  DoneCmd  `cmd:"" help:"Mark a reminder as done (experimental)"`
 	Rm    RmCmd    `cmd:"" help:"Delete a reminder"`
 }
 
 // EditCmd updates selected reminder fields.
 type EditCmd struct {
-	ID       string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
-	Due      string `help:"Replacement due date"`
-	Priority string `short:"p" help:"Priority: high, medium, low, none"`
+	ID          string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
+	Title       string `help:"Replacement title (experimental)"`
+	Description string `short:"d" help:"Replacement description (experimental)"`
+	Due         string `help:"Replacement due date"`
+	Priority    string `short:"p" help:"Priority: high, medium, low, none"`
 }
 
 func (c *EditCmd) Run() error {
@@ -185,6 +188,13 @@ func (c *EditCmd) Run() error {
 		return err
 	}
 
+	var title, description *string
+	if c.Title != "" {
+		title = &c.Title
+	}
+	if c.Description != "" {
+		description = &c.Description
+	}
 	var dueDate *time.Time
 	if c.Due != "" {
 		parsed, err := parseDueDate(c.Due)
@@ -201,16 +211,16 @@ func (c *EditCmd) Run() error {
 		}
 		priority = &value
 	}
-	if dueDate == nil && priority == nil {
-		return fmt.Errorf("no changes specified; use --due or --priority")
+	if title == nil && description == nil && dueDate == nil && priority == nil {
+		return fmt.Errorf("no changes specified; use --title, --description, --due, or --priority")
 	}
 	changes := cloudkit.ReminderChanges{
-		DueDate: dueDate, Priority: priority,
+		Title: title, Notes: description, DueDate: dueDate, Priority: priority,
 	}
 	if err := svc.Update(guid, changes); err != nil {
 		return fmt.Errorf("edit reminder: %w", err)
 	}
-	color.Green("✓ Updated")
+	color.Green("✓ Update submitted")
 	return nil
 }
 
@@ -470,6 +480,27 @@ func parseDueDate(s string) (time.Time, error) {
 		}
 		return time.Time{}, fmt.Errorf("unrecognized format: %s", s)
 	}
+}
+
+// DoneCmd submits an experimental completion mutation.
+type DoneCmd struct {
+	ID string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
+}
+
+func (c *DoneCmd) Run() error {
+	svc, err := getRemindersService()
+	if err != nil {
+		return err
+	}
+	guid, err := resolveReminderID(svc, c.ID)
+	if err != nil {
+		return err
+	}
+	if err := svc.Complete(guid); err != nil {
+		return fmt.Errorf("complete reminder: %w", err)
+	}
+	color.Green("✓ Completion submitted")
+	return nil
 }
 
 // RmCmd deletes a reminder

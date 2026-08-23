@@ -208,11 +208,12 @@ First use `records/lookup` to obtain the current `recordChangeTag`, then send an
 ```
 
 Priority and due-date updates are live-tested. Title and notes replacements are
-not supported: the server accepts a newly encoded CRDT snapshot but later
-reconciles the old text back into the record.
+experimental: the server accepts a newly encoded CRDT snapshot but may later
+reconcile the old text back into the record.
 
-Completion is also not supported: live tests show CloudKit reconciling both
-`Completed` and `CompletionDate` updates back to the incomplete state.
+Completion is also experimental: send numeric `Completed` and
+`CompletionDate`, but be aware that live tests observed CloudKit reconciling
+both fields back to the incomplete state.
 
 ### Delete a reminder
 

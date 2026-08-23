@@ -761,9 +761,6 @@ func (s *RemindersService) AddReminder(title, notes, listID string, priority int
 
 // UpdateReminder applies a partial update using CloudKit optimistic locking.
 func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderChanges) error {
-	if changes.Title != nil || changes.Notes != nil {
-		return fmt.Errorf("updating reminder title or notes is not supported: CloudKit accepts the request but discards the replacement CRDT document")
-	}
 	if err := s.ensureZone(); err != nil {
 		return err
 	}
@@ -772,6 +769,20 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 		return err
 	}
 	fields := make(map[string]FieldValue)
+	if changes.Title != nil {
+		encoded, err := encodeTitleDocument(*changes.Title)
+		if err != nil {
+			return fmt.Errorf("encode title: %w", err)
+		}
+		fields["TitleDocument"] = FieldValue{Value: encoded}
+	}
+	if changes.Notes != nil {
+		encoded, err := encodeTitleDocument(*changes.Notes)
+		if err != nil {
+			return fmt.Errorf("encode notes: %w", err)
+		}
+		fields["NotesDocument"] = FieldValue{Value: encoded}
+	}
 	if changes.Priority != nil {
 		fields["Priority"] = FieldValue{Value: *changes.Priority}
 	}
@@ -803,6 +814,46 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 	}
 	if err := recordError(response.Records[0]); err != nil {
 		return fmt.Errorf("update reminder: %w", err)
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
+}
+
+// CompleteReminder submits the completion fields used by Reminders. CloudKit
+// may reconcile this undocumented mutation back to the previous state.
+func (s *RemindersService) CompleteReminder(reminderID string) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+	request := ModifyRequest{
+		ZoneID: s.zoneID,
+		Operations: []RecordOperation{{
+			OperationType: OperationUpdate,
+			Record: Record{
+				RecordName:      reminderID,
+				RecordType:      "Reminder",
+				RecordChangeTag: existing.RecordChangeTag,
+				Fields: map[string]FieldValue{
+					"Completed":      {Value: int64(1)},
+					"CompletionDate": {Value: time.Now().UnixMilli()},
+				},
+			},
+		}},
+	}
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, request)
+	if err != nil {
+		return fmt.Errorf("complete reminder: %w", err)
+	}
+	if len(response.Records) == 0 {
+		return fmt.Errorf("complete reminder: no record returned")
+	}
+	if err := recordError(response.Records[0]); err != nil {
+		return fmt.Errorf("complete reminder: %w", err)
 	}
 	s.records[reminderID] = mergeRecord(existing, response.Records[0])
 	s.persistCache()
