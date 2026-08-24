@@ -85,6 +85,17 @@ func TestFindReminderByIDRequiresUniquePrefix(t *testing.T) {
 	}
 }
 
+func TestResolveReminderListRejectsUnknownSelector(t *testing.T) {
+	lists := []reminders.Collection{{GUID: "List/ONE", Title: "Inbox"}}
+	if _, err := resolveReminderList(lists, "Missing"); err == nil || !strings.Contains(err.Error(), "list not found") {
+		t.Fatalf("unknown list error = %v", err)
+	}
+	guid, err := resolveReminderList(lists, "inbox")
+	if err != nil || guid != "List/ONE" {
+		t.Fatalf("resolved list = %q, err = %v", guid, err)
+	}
+}
+
 func TestRenderReminderShowJSONIsStableAndMachineReadable(t *testing.T) {
 	view := reminderShowView{
 		Reminder: reminders.ParsedReminder{GUID: "ABC12345", RecordName: "Reminder/ABC12345", Title: "Buy milk", Priority: 1},

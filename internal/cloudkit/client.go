@@ -148,7 +148,7 @@ func (c *Client) FetchChanges(container, env, database string, zoneID ZoneID, sy
 			"CompletionDate", "DueDate", "List", "Deleted", "Priority",
 			"ParentReminder", "Flagged", "CreationDate", "LastModifiedDate",
 			"ResolutionTokenMap", "UrgentPresentationAlarmsAsData",
-			"UrgentPresentationAlarmsChecksum",
+			"UrgentPresentationAlarmsChecksum", "DueDateDeltaAlertsData",
 		},
 	}
 	if syncToken != "" {

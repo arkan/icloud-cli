@@ -756,10 +756,11 @@ func encodePosition(replica uint64, offset int64) []byte {
 }
 
 // encodeTitleDocument encodes Apple's Reminders CRDT document format.
-// Character counts deliberately use Unicode code points rather than UTF-8 bytes.
+// Reminders CRDT offsets use NSString/UTF-16 code units, not UTF-8 bytes or
+// Unicode code points.
 func encodeTitleDocument(title string) (string, error) {
 	titleBytes := []byte(title)
-	charLength := uint64(utf8.RuneCountInString(title))
+	charLength := uint64(len(utf16.Encode([]rune(title))))
 
 	op1 := encodeField(1, 2, encodePosition(0, 0))
 	op1 = append(op1, encodeField(2, 0, uint64(0))...)
@@ -893,7 +894,6 @@ func replaceCRDTString(message []byte, text string, replicaUUID uuid.UUID) ([]by
 	if err != nil {
 		return nil, fmt.Errorf("decode vector timestamp: %w", err)
 	}
-	var maximumCharClock uint64
 	var maximumTimestamp uint64
 	for _, fieldIndex := range substringIndexes {
 		substring, decodeErr := decodeProtobufFields(fields[fieldIndex].payload)
@@ -904,17 +904,7 @@ func replaceCRDTString(message []byte, text string, replicaUUID uuid.UUID) ([]by
 		charFields, _ := decodeProtobufFields(charID)
 		replica := protobufVarintValue(charFields, 1)
 		clock := protobufVarintValue(charFields, 2)
-		substringLength := protobufVarintValue(substring, 2)
 		isSentinel := replica == 0 && clock == 0xffffffff
-		if !isSentinel {
-			end := clock
-			if substringLength > 0 {
-				end += substringLength - 1
-			}
-			if end > maximumCharClock {
-				maximumCharClock = end
-			}
-		}
 		if !isSentinel {
 			timestamp, _ := protobufBytesValue(substring, 3)
 			timestampFields, _ := decodeProtobufFields(timestamp)
@@ -924,7 +914,10 @@ func replaceCRDTString(message []byte, text string, replicaUUID uuid.UUID) ([]by
 		}
 	}
 	length := uint64(len(utf16.Encode([]rune(text))))
-	newCharClock := maximumCharClock
+	// Character clocks are local to a replica. Borrowing another replica's
+	// largest clock creates a gap that Reminders resolves as a concurrent insert,
+	// concatenating the replacement with the old text.
+	newCharClock := uint64(0)
 	tombstoneTimestamp := maximumTimestamp + 1
 	replicaSlot := -1
 	var replicaTimestamp uint64
@@ -1382,14 +1375,25 @@ func (s *RemindersService) AddReminderWithParent(title, notes, listID string, pr
 		return nil, fmt.Errorf("encode title: %w", err)
 	}
 
+	now := time.Now()
+	resolutionKeys := []string{
+		"titleDocument", "completed", "creationDate", "lastModifiedDate",
+		"priority", "flagged", "allDay", "minimumSupportedVersion", "icsDisplayOrder",
+	}
 	fields := map[string]FieldValue{
-		"TitleDocument": {Value: titleDoc},
-		"Completed":     {Value: 0},
+		"TitleDocument":    {Value: titleDoc},
+		"Completed":        {Value: int64(0), Type: "NUMBER_INT64"},
+		"CreationDate":     {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+		"LastModifiedDate": {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+		"Priority":         {Value: int64(priority), Type: "NUMBER_INT64"},
+		"Flagged":          {Value: int64(0), Type: "NUMBER_INT64"},
+		"AllDay":           {Value: int64(0), Type: "NUMBER_INT64"},
 	}
 
 	// Add due date if provided
 	if dueDate != nil {
-		fields["DueDate"] = FieldValue{Value: dueDate.UnixMilli()}
+		fields["DueDate"] = FieldValue{Value: dueDate.UnixMilli(), Type: "TIMESTAMP"}
+		resolutionKeys = append(resolutionKeys, "dueDate")
 	}
 
 	// Add notes if provided
@@ -1399,16 +1403,21 @@ func (s *RemindersService) AddReminderWithParent(title, notes, listID string, pr
 			return nil, fmt.Errorf("encode notes: %w", err)
 		}
 		fields["NotesDocument"] = FieldValue{Value: notesDoc}
-	}
-	if priority != 0 {
-		fields["Priority"] = FieldValue{Value: priority}
+		resolutionKeys = append(resolutionKeys, "notesDocument")
 	}
 	if listID != "" {
 		fields["List"] = FieldValue{Value: RecordReference{RecordName: listID, Action: "NONE"}}
+		resolutionKeys = append(resolutionKeys, "list")
 	}
 	if parentID != "" {
 		fields["ParentReminder"] = FieldValue{Value: RecordReference{RecordName: parentID, Action: "NONE"}}
+		resolutionKeys = append(resolutionKeys, "parentReminder")
 	}
+	tokenMap, err := newResolutionTokenMap(resolutionKeys...)
+	if err != nil {
+		return nil, fmt.Errorf("encode reminder resolution tokens: %w", err)
+	}
+	fields["ResolutionTokenMap"] = FieldValue{Value: tokenMap, Type: "STRING"}
 
 	record := Record{
 		RecordName: recordName,
@@ -1476,7 +1485,8 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 		resolutionKeys = append(resolutionKeys, "notesDocument")
 	}
 	if changes.Priority != nil {
-		fields["Priority"] = FieldValue{Value: *changes.Priority}
+		fields["Priority"] = FieldValue{Value: int64(*changes.Priority), Type: "NUMBER_INT64"}
+		resolutionKeys = append(resolutionKeys, "priority")
 	}
 	if changes.Flagged != nil {
 		value := int64(0)
@@ -1555,16 +1565,62 @@ func addResolutionTokenUpdates(record Record, fields map[string]FieldValue, keys
 	if envelope.Map == nil {
 		envelope.Map = make(map[string]map[string]interface{})
 	}
+	maxCounter := float64(0)
+	for tokenKey, token := range envelope.Map {
+		counter, ok := token["counter"].(float64)
+		if !ok {
+			return fmt.Errorf("resolution token %q has no numeric counter", tokenKey)
+		}
+		if counter > maxCounter {
+			maxCounter = counter
+		}
+	}
 	now := time.Now()
 	coreDataTime := float64(now.UnixMilli())/1000 - 978307200
+	replicaID := strings.ToUpper(uuid.New().String())
+	newToken := func(counter float64) map[string]interface{} {
+		return map[string]interface{}{
+			"counter": counter, "modificationTime": coreDataTime,
+			"replicaID": replicaID,
+		}
+	}
+	recoveredCounter := maxCounter + 1
+	if recoveredCounter < 1 {
+		recoveredCounter = 1
+	}
+	fieldTokens := map[string]string{
+		"TitleDocument": "titleDocument", "NotesDocument": "notesDocument",
+		"Priority": "priority", "Flagged": "flagged", "DueDate": "dueDate",
+		"AllDay": "allDay", "TimeZone": "timeZone", "Completed": "completed",
+		"CompletionDate": "completionDate", "CreationDate": "creationDate",
+		"List": "list", "ParentReminder": "parentReminder",
+		"DueDateDeltaAlertsData":           "dueDateDeltaAlertsData",
+		"UrgentPresentationAlarmsChecksum": "urgentPresentationAlarmsChecksum",
+	}
+	repairNeeded := false
+	for fieldName, tokenKey := range fieldTokens {
+		existingField, existingOK := record.Fields[fieldName]
+		if !existingOK || existingField.Value == nil {
+			continue
+		}
+		if _, exists := envelope.Map[tokenKey]; !exists {
+			envelope.Map[tokenKey] = newToken(recoveredCounter)
+			repairNeeded = true
+		}
+	}
+	if repairNeeded {
+		if _, exists := record.Fields["CreationDate"]; !exists && record.Created != nil && record.Created.Timestamp != 0 {
+			fields["CreationDate"] = FieldValue{Value: record.Created.Timestamp, Type: "TIMESTAMP"}
+			if _, exists := envelope.Map["creationDate"]; !exists {
+				envelope.Map["creationDate"] = newToken(recoveredCounter)
+			}
+		}
+	}
 	keys = append(keys, "lastModifiedDate")
 	for _, tokenKey := range keys {
 		token, ok := envelope.Map[tokenKey]
 		if !ok {
-			envelope.Map[tokenKey] = map[string]interface{}{
-				"counter": float64(1), "modificationTime": coreDataTime,
-				"replicaID": strings.ToUpper(uuid.New().String()),
-			}
+			envelope.Map[tokenKey] = newToken(1)
 			continue
 		}
 		counter, ok := token["counter"].(float64)
@@ -1578,7 +1634,7 @@ func addResolutionTokenUpdates(record Record, fields map[string]FieldValue, keys
 	if err != nil {
 		return err
 	}
-	fields["ResolutionTokenMap"] = FieldValue{Value: string(updated)}
+	fields["ResolutionTokenMap"] = FieldValue{Value: string(updated), Type: "STRING"}
 	fields["LastModifiedDate"] = FieldValue{Value: now.UnixMilli(), Type: "TIMESTAMP"}
 	return nil
 }
@@ -1737,19 +1793,17 @@ func (s *RemindersService) UpdateAssignment(reminderID, assignee string, clear b
 			},
 		})
 	}
-	tokenMap, err := newResolutionTokenMap("assignmentIDs", "lastModifiedDate")
-	if err != nil {
-		return err
+	parentFields := map[string]FieldValue{
+		"AssignmentIDs": {Value: assignmentIDs, Type: "STRING_LIST"},
+	}
+	if err := addResolutionTokenUpdates(existing, parentFields, "assignmentIDs"); err != nil {
+		return fmt.Errorf("update assignment resolution tokens: %w", err)
 	}
 	operations := append([]RecordOperation{{
 		OperationType: OperationUpdate,
 		Record: Record{
 			RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag,
-			Fields: map[string]FieldValue{
-				"AssignmentIDs":      {Value: assignmentIDs, Type: "STRING_LIST"},
-				"ResolutionTokenMap": {Value: tokenMap, Type: "STRING"},
-				"LastModifiedDate":   {Value: now.UnixMilli(), Type: "TIMESTAMP"},
-			},
+			Fields: parentFields,
 		},
 	}}, childOperations...)
 	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
@@ -1832,7 +1886,6 @@ func (s *RemindersService) UpdateLocationAlarm(reminderID string, location *Loca
 		return nil
 	}
 
-	now := time.Now()
 	childOperations := deleteOperations
 	if location != nil {
 		alarmID := strings.ToUpper(uuid.New().String())
@@ -1882,19 +1935,17 @@ func (s *RemindersService) UpdateLocationAlarm(reminderID string, location *Loca
 		)
 	}
 
-	tokenMap, err := newResolutionTokenMap("lastModifiedDate")
-	if err != nil {
-		return err
+	parentFields := map[string]FieldValue{
+		"AlarmIDs": {Value: remainingAlarmIDs, Type: "STRING_LIST"},
+	}
+	if err := addResolutionTokenUpdates(existing, parentFields); err != nil {
+		return fmt.Errorf("update location alarm resolution tokens: %w", err)
 	}
 	operations := append([]RecordOperation{{
 		OperationType: OperationUpdate,
 		Record: Record{
 			RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag,
-			Fields: map[string]FieldValue{
-				"AlarmIDs":           {Value: remainingAlarmIDs, Type: "STRING_LIST"},
-				"ResolutionTokenMap": {Value: tokenMap, Type: "STRING"},
-				"LastModifiedDate":   {Value: now.UnixMilli(), Type: "TIMESTAMP"},
-			},
+			Fields: parentFields,
 		},
 	}}, childOperations...)
 	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
@@ -2237,6 +2288,11 @@ func (s *RemindersService) UpdateRecurrence(reminderID string, recurrence *Recur
 	if err != nil {
 		return err
 	}
+	if recurrence != nil {
+		if _, ok := numericInt64(existing.Fields["DueDate"].Value); !ok {
+			return fmt.Errorf("recurring reminders require a valid due date")
+		}
+	}
 	currentIDs := fieldStringList(existing.Fields["RecurrenceRuleIDs"].Value)
 	operations := make([]RecordOperation, 0, len(currentIDs)+2)
 	currentRules := make([]Record, 0, len(currentIDs))
@@ -2307,9 +2363,6 @@ func (s *RemindersService) UpdateRecurrence(reminderID string, recurrence *Recur
 		ids = append(ids, currentIDs...)
 	}
 	if recurrence != nil && !updateExisting {
-		if _, ok := existing.Fields["DueDate"]; !ok {
-			return fmt.Errorf("recurring reminders require a due date")
-		}
 		id := strings.ToUpper(uuid.New().String())
 		ids = append(ids, id)
 		fields := map[string]FieldValue{
@@ -2421,6 +2474,18 @@ type urgentPresentationAlarmAccount struct {
 	PersonID   string  `json:"personID"`
 }
 
+// ValidateUrgentReminderSupport verifies that native account metadata needed
+// for an Urgent alarm is available without mutating a reminder.
+func (s *RemindersService) ValidateUrgentReminderSupport() error {
+	if err := s.Sync(true); err != nil {
+		return fmt.Errorf("sync urgent reminder account state: %w", err)
+	}
+	if _, ok := s.findUrgentPresentationEnvelope(Record{}); ok {
+		return nil
+	}
+	return fmt.Errorf("cannot determine the Urgent alarm person identifier; enable Urgent once in Reminders and sync it first")
+}
+
 // UpdateUrgentReminder enables or disables the alarm that bypasses Focus and
 // silent mode when the reminder becomes due.
 func (s *RemindersService) UpdateUrgentReminder(reminderID string, enabled bool) error {
@@ -2485,23 +2550,28 @@ func (s *RemindersService) UpdateUrgentReminder(reminderID string, enabled bool)
 }
 
 func (s *RemindersService) urgentPresentationEnvelope(existing Record) (urgentPresentationAlarmsEnvelope, error) {
-	if envelope, ok := s.decodeUrgentPresentationEnvelope(existing); ok {
+	if envelope, ok := s.findUrgentPresentationEnvelope(existing); ok {
 		return envelope, nil
-	}
-	for _, record := range s.records {
-		if envelope, ok := s.decodeUrgentPresentationEnvelope(record); ok {
-			return envelope, nil
-		}
 	}
 	if err := s.Sync(true); err != nil {
 		return urgentPresentationAlarmsEnvelope{}, fmt.Errorf("find urgent reminder account state: %w", err)
 	}
-	for _, record := range s.records {
-		if envelope, ok := s.decodeUrgentPresentationEnvelope(record); ok {
-			return envelope, nil
-		}
+	if envelope, ok := s.findUrgentPresentationEnvelope(existing); ok {
+		return envelope, nil
 	}
 	return urgentPresentationAlarmsEnvelope{}, fmt.Errorf("cannot determine the Urgent alarm person identifier; enable Urgent once in Reminders and sync it first")
+}
+
+func (s *RemindersService) findUrgentPresentationEnvelope(existing Record) (urgentPresentationAlarmsEnvelope, bool) {
+	if envelope, ok := s.decodeUrgentPresentationEnvelope(existing); ok {
+		return envelope, true
+	}
+	for _, record := range s.records {
+		if envelope, ok := s.decodeUrgentPresentationEnvelope(record); ok {
+			return envelope, true
+		}
+	}
+	return urgentPresentationAlarmsEnvelope{}, false
 }
 
 func (s *RemindersService) decodeUrgentPresentationEnvelope(record Record) (urgentPresentationAlarmsEnvelope, bool) {
@@ -2546,8 +2616,8 @@ func (s *RemindersService) UpdateEarlyReminder(reminderID string, alert *EarlyRe
 		return err
 	}
 	if alert != nil {
-		if _, ok := existing.Fields["DueDate"]; !ok {
-			return fmt.Errorf("early reminders require a due date")
+		if _, ok := numericInt64(existing.Fields["DueDate"].Value); !ok {
+			return fmt.Errorf("early reminders require a valid due date")
 		}
 	} else if _, ok := existing.Fields["DueDateDeltaAlertsData"]; !ok {
 		return nil
@@ -2600,6 +2670,16 @@ func (s *RemindersService) UpdateEarlyReminder(reminderID string, alert *EarlyRe
 	s.records[reminderID] = mergeRecord(existing, response.Records[0])
 	s.persistCache()
 	return nil
+}
+
+// ValidateEarlyReminderSupport verifies that native account metadata needed
+// for an early alert is available without creating a partial reminder.
+func (s *RemindersService) ValidateEarlyReminderSupport() error {
+	if err := s.Sync(true); err != nil {
+		return fmt.Errorf("sync early reminder account state: %w", err)
+	}
+	_, err := s.earlyReminderAccountIdentifier(Record{})
+	return err
 }
 
 func (s *RemindersService) earlyReminderAccountIdentifier(existing Record) (string, error) {
@@ -2739,9 +2819,11 @@ func (s *RemindersService) UpdateTags(reminderID string, add, remove []string) e
 		return nil
 	}
 
-	tokenMap, err := newResolutionTokenMap("hashtagIDs", "lastModifiedDate")
-	if err != nil {
-		return err
+	parentFields := map[string]FieldValue{
+		"HashtagIDs": {Value: ids, Type: "STRING_LIST"},
+	}
+	if err := addResolutionTokenUpdates(existing, parentFields, "hashtagIDs"); err != nil {
+		return fmt.Errorf("update tag resolution tokens: %w", err)
 	}
 	reminderOperation := RecordOperation{
 		OperationType: OperationUpdate,
@@ -2749,11 +2831,7 @@ func (s *RemindersService) UpdateTags(reminderID string, add, remove []string) e
 			RecordName:      reminderID,
 			RecordType:      "Reminder",
 			RecordChangeTag: existing.RecordChangeTag,
-			Fields: map[string]FieldValue{
-				"HashtagIDs":         {Value: ids, Type: "STRING_LIST"},
-				"ResolutionTokenMap": {Value: tokenMap, Type: "STRING"},
-				"LastModifiedDate":   {Value: now.UnixMilli(), Type: "TIMESTAMP"},
-			},
+			Fields:          parentFields,
 		},
 	}
 	operations := append([]RecordOperation{reminderOperation}, childOperations...)

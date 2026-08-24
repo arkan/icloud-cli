@@ -157,24 +157,40 @@ func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.Due
 		}
 		listGUID = lists[0].ID
 	}
+	if earlyReminder != nil {
+		if err := s.cloudkitSvc.ValidateEarlyReminderSupport(); err != nil {
+			return fmt.Errorf("validate reminder early alert: %w", err)
+		}
+	}
+	if urgent {
+		if err := s.cloudkitSvc.ValidateUrgentReminderSupport(); err != nil {
+			return fmt.Errorf("validate reminder Urgent alarm: %w", err)
+		}
+	}
 
 	created, err := s.cloudkitSvc.AddReminderWithParent(title, description, listGUID, priority, nil, parentGUID)
 	if err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
+	rollback := func(step string, cause error) error {
+		if rollbackErr := s.cloudkitSvc.DeleteReminder(created.ID); rollbackErr != nil {
+			return fmt.Errorf("%s: %w; rollback of new reminder %s failed: %v", step, cause, created.ID, rollbackErr)
+		}
+		return fmt.Errorf("%s: %w", step, cause)
+	}
 	if dueDate != nil {
 		if err := s.cloudkitSvc.UpdateDueDate(created.ID, dueDate); err != nil {
-			return fmt.Errorf("set reminder due date: %w", err)
+			return rollback("set reminder due date", err)
 		}
 	}
 	if earlyReminder != nil {
 		if err := s.cloudkitSvc.UpdateEarlyReminder(created.ID, earlyReminder); err != nil {
-			return fmt.Errorf("set reminder early alert: %w", err)
+			return rollback("set reminder early alert", err)
 		}
 	}
 	if urgent {
 		if err := s.cloudkitSvc.UpdateUrgentReminder(created.ID, true); err != nil {
-			return fmt.Errorf("set reminder Urgent alarm: %w", err)
+			return rollback("set reminder Urgent alarm", err)
 		}
 	}
 

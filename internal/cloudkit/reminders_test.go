@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/arkan/icloud-cli/internal/api"
 	"github.com/arkan/icloud-cli/internal/config"
@@ -91,6 +92,28 @@ func TestAddReminderUsesRemindersCloudKitContract(t *testing.T) {
 		t.Errorf("TitleDocument should not force a CloudKit type, got %q", titleField.Type)
 	}
 	assertCRDTDocumentContains(t, titleField.Value.(string), "Café 🛒")
+	assertMergeableStringLengths(t, titleField.Value.(string))
+	for _, fieldName := range []string{"Completed", "CreationDate", "LastModifiedDate", "Priority", "Flagged", "AllDay", "List", "ResolutionTokenMap"} {
+		if _, ok := record.Fields[fieldName]; !ok {
+			t.Errorf("create payload is missing native field %q", fieldName)
+		}
+	}
+	for _, fieldName := range []string{"Completed", "Priority", "Flagged", "AllDay"} {
+		if field := record.Fields[fieldName]; field.Type != "NUMBER_INT64" {
+			t.Errorf("%s field = %#v", fieldName, field)
+		}
+	}
+	for _, fieldName := range []string{"CreationDate", "LastModifiedDate"} {
+		if field := record.Fields[fieldName]; field.Type != "TIMESTAMP" {
+			t.Errorf("%s field = %#v", fieldName, field)
+		}
+	}
+	tokens := resolutionTokens(t, record.Fields)
+	for _, key := range []string{"titleDocument", "priority", "flagged", "allDay", "list", "completed", "creationDate", "lastModifiedDate", "minimumSupportedVersion", "icsDisplayOrder"} {
+		if tokens[key] == nil {
+			t.Errorf("create payload is missing resolution token %q", key)
+		}
+	}
 }
 
 func TestGetReminderRecordReturnsExactCloudKitRecord(t *testing.T) {
@@ -261,6 +284,13 @@ func TestFetchChangesUsesZoneEndpointAndOwner(t *testing.T) {
 	if len(request.Zones) != 1 || request.Zones[0].ZoneID != zone || request.Zones[0].SyncToken != "previous" {
 		t.Errorf("request = %#v", request)
 	}
+	desired := make(map[string]bool)
+	for _, key := range request.Zones[0].DesiredKeys {
+		desired[key] = true
+	}
+	if !desired["DueDateDeltaAlertsData"] {
+		t.Errorf("FetchChanges desired keys omit DueDateDeltaAlertsData: %#v", request.Zones[0].DesiredKeys)
+	}
 	if len(changes.Records) != 1 || changes.Records[0].RecordChangeTag != "c1" || changes.SyncToken != "next" {
 		t.Errorf("changes = %#v", changes)
 	}
@@ -277,7 +307,7 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
 		case strings.Contains(r.URL.Path, "/records/lookup"):
 			lookupCount++
-			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"ABC-123","recordType":"Reminder","recordChangeTag":"change-%d","fields":{"ResolutionTokenMap":{"value":"{\"map\":{\"titleDocument\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"notesDocument\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"flagged\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"completed\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"completionDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"lastModifiedDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"}}}"}}}]}`, lookupCount+6)
+			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"ABC-123","recordType":"Reminder","recordChangeTag":"change-%d","fields":{"ResolutionTokenMap":{"value":"{\"map\":{\"titleDocument\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"notesDocument\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"priority\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"flagged\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"completed\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"completionDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"lastModifiedDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"}}}"}}}]}`, lookupCount+6)
 		case strings.Contains(r.URL.Path, "/records/modify"):
 			var request ModifyRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -326,7 +356,7 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 		t.Errorf("flagged field = %#v", edit.Record.Fields["Flagged"])
 	}
 	tokens := resolutionTokens(t, edit.Record.Fields)
-	for _, key := range []string{"titleDocument", "notesDocument", "flagged", "lastModifiedDate"} {
+	for _, key := range []string{"titleDocument", "notesDocument", "priority", "flagged", "lastModifiedDate"} {
 		if counter := tokens[key]["counter"]; counter != float64(3) {
 			t.Errorf("resolution token %q counter = %#v, want 3", key, counter)
 		}
@@ -377,6 +407,7 @@ func TestReplaceDocumentTextTombstonesOldContent(t *testing.T) {
 	if !bytes.Contains(replacedRaw, []byte("Café replacement 🛒")) {
 		t.Fatalf("replacement is missing new text: %x", replacedRaw)
 	}
+	assertMergeableStringLengths(t, replaced)
 	wrapper, ok := protobufBytesField(replacedRaw, 2)
 	if !ok {
 		t.Fatal("missing document wrapper")
@@ -476,8 +507,8 @@ func TestReplaceDocumentTextTombstonesOldContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if replica, clock := protobufVarintTestField(newCharFields, 1), protobufVarintTestField(newCharFields, 2); replica != 2 || clock != 7 {
-		t.Fatalf("new character ID = (%d,%d), want (2,7)", replica, clock)
+	if replica, clock := protobufVarintTestField(newCharFields, 1), protobufVarintTestField(newCharFields, 2); replica != 2 || clock != 0 {
+		t.Fatalf("new character ID = (%d,%d), want (2,0)", replica, clock)
 	}
 	if metadataEntries != 2 {
 		t.Fatalf("metadata replica count = %d, want 2", metadataEntries)
@@ -525,8 +556,8 @@ func TestReplaceDocumentTextTombstonesOldContent(t *testing.T) {
 	}
 	latestCharID, _ := protobufBytesTestField(latest, 1)
 	latestCharFields, _ := decodeProtobufFields(latestCharID)
-	if replica, clock := protobufVarintTestField(latestCharFields, 1), protobufVarintTestField(latestCharFields, 2); replica != 2 || clock != 26 {
-		t.Fatalf("second edit character ID = (%d,%d), want (2,26)", replica, clock)
+	if replica, clock := protobufVarintTestField(latestCharFields, 1), protobufVarintTestField(latestCharFields, 2); replica != 2 || clock != 19 {
+		t.Fatalf("second edit character ID = (%d,%d), want (2,19)", replica, clock)
 	}
 	previousLive, err := decodeProtobufFields(secondSubstrings[2].payload)
 	if err != nil {
@@ -536,6 +567,139 @@ func TestReplaceDocumentTextTombstonesOldContent(t *testing.T) {
 	previousTimestampFields, _ := decodeProtobufFields(previousTimestamp)
 	if clock := protobufVarintTestField(previousTimestampFields, 2); clock != 4 {
 		t.Fatalf("second edit tombstone timestamp = %d, want 4", clock)
+	}
+}
+
+const nativeEditedTitleDocumentFixture = `H4sIAAAAAAAAE+NgEFrByMEgwCC1kFFI29nfJUI3ONLPWdfIwMjMwMLIBMgwNtd1UnAMCFDISyzJLEtVSE3JLElNkRLgYgHpA+oE0xqMYBFGAVUBbSkQzaDBJCUEFmEQUAWLcCgwajBLiXFxANX/BwJ+oF44W0mGS4pLYIHeHvYVy10FZqsocUxe7RIjxMQRAMScWiwc2hoMAHFbZgutAAAA`
+
+const corruptEmojiTitleDocumentFixture = `H4sIAAAAAAAA/+JgEOpl5GAQYJBqYxRSy0zOyS9N0U3OyVTIzCtJTS9KLMnMz1MwNLcwN7E0NzEyUfgwf/YkKQEuFpAWAQYpMK3BCBZhFGAQUJYC0xpMUmJcHBwMAv/////PL8AgBWcryXBJcQk8uTbj9ZZcj03LknZcuVt6tFCIiUNZiImDUYuJQxkQAAD//03sRmmSAAAA`
+
+const corruptConcatenatedTitleDocumentFixture = `H4sIAAAAAAAAE+NgENrOzMEgwCC1gVlI3znIJUQhL7EksyxVoSi1ICcxOTU3Na/EDyJSUJSfm1+SmqKQlFicmpOZlyolwsUC0gvUDaY1GDWYNdilBICizAJhAuJSIJpBg0lKCCjCCFSnCBbhVGDU4ASrYhPQE5CQAtEMGixgVWwCkgKiYBGQKlawGCtQpxRYjAMoxgYWYwKKiUiB5BjBpgmB7dQT0IDbwAEWYwGq0wOLcYDViXFxAF36Hwj4ga6Gs5VWMHJJcQlwHM7jcf3tvm5NlXn3oxVXAoWYOBSBGCwXIaa4iCndWWtfaftT9dj7zEBxKSBmAskliOzZ5Mble7/l8QUe16D7yUDxXCDmAslV1RiXZOr5CyyL3y+/2SE+HSiuBzNzgd4e9hXLXQVmqyhxTF7tEoNs5rlv6z83GPkI9XGnPVkSdXoKUNwNZKYWE4e4FguHhAYDAO+d8C28AQAA`
+
+func TestReplaceDocumentTextAcceptsNativeEditedFixture(t *testing.T) {
+	replicaID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	replaced, err := replaceDocumentText(nativeEditedTitleDocumentFixture, "CLI replacement 🛒", replicaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := decodeCRDTTestDocument(t, replaced)
+	if bytes.Contains(raw, []byte("APP native edited")) {
+		t.Fatalf("replacement retained native live text: %x", raw)
+	}
+	if !bytes.Contains(raw, []byte("CLI replacement 🛒")) {
+		t.Fatalf("replacement is missing new text: %x", raw)
+	}
+	assertMergeableStringLengths(t, replaced)
+	wrapper, _ := protobufBytesField(raw, 2)
+	note, _ := protobufBytesField(wrapper, 3)
+	fields, err := decodeProtobufFields(note)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var liveCharacterClock uint64
+	var replicaCharacterClock uint64
+	for _, field := range fields {
+		switch field.number {
+		case 3:
+			substring, _ := decodeProtobufFields(field.payload)
+			characterID, _ := protobufBytesTestField(substring, 1)
+			characterFields, _ := decodeProtobufFields(characterID)
+			if protobufVarintTestField(characterFields, 1) == 2 && !protobufBoolField(substring, 4) {
+				liveCharacterClock = protobufVarintTestField(characterFields, 2)
+			}
+		case 4:
+			metadata, _ := decodeProtobufFields(field.payload)
+			for _, metadataField := range metadata {
+				entry, _ := decodeProtobufFields(metadataField.payload)
+				entryUUID, _ := protobufBytesTestField(entry, 1)
+				if !bytes.Equal(entryUUID, replicaID[:]) {
+					continue
+				}
+				for _, entryField := range entry {
+					if entryField.number == 2 {
+						clock, _ := decodeProtobufFields(entryField.payload)
+						replicaCharacterClock = protobufVarintTestField(clock, 1)
+						break
+					}
+				}
+			}
+		}
+	}
+	if liveCharacterClock != 0 {
+		t.Fatalf("new replica character clock = %d, want 0", liveCharacterClock)
+	}
+	if replicaCharacterClock != 18 {
+		t.Fatalf("new replica vector clock = %d, want 18", replicaCharacterClock)
+	}
+}
+
+func TestReplaceDocumentTextRepairsCapturedCorruptEmojiFixture(t *testing.T) {
+	textLength, liveLength, attributeLength := mergeableStringLengths(t, corruptEmojiTitleDocumentFixture)
+	if textLength != 36 || liveLength != 35 || attributeLength != 35 {
+		t.Fatalf("captured corrupt lengths: text=%d live=%d attribute=%d", textLength, liveLength, attributeLength)
+	}
+	replicaID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	repaired, err := replaceDocumentText(
+		corruptEmojiTitleDocumentFixture,
+		"icloud-cli integration 1787497424 🛒",
+		replicaID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMergeableStringLengths(t, repaired)
+}
+
+func TestReplaceDocumentTextRepairsCapturedConcatenatedFixture(t *testing.T) {
+	textLength, liveLength, attributeLength := mergeableStringLengths(t, corruptConcatenatedTitleDocumentFixture)
+	if textLength == liveLength && textLength == attributeLength {
+		t.Fatalf("captured concatenated fixture unexpectedly valid: text=%d live=%d attribute=%d", textLength, liveLength, attributeLength)
+	}
+	replicaID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	repaired, err := replaceDocumentText(
+		corruptConcatenatedTitleDocumentFixture,
+		"CRDT native replacement",
+		replicaID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMergeableStringLengths(t, repaired)
+}
+
+func TestEncodeTitleDocumentUsesUTF16CharacterCounts(t *testing.T) {
+	encoded, err := encodeTitleDocument("🛒")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := decodeCRDTTestDocument(t, encoded)
+	wrapper, ok := protobufBytesField(raw, 2)
+	if !ok {
+		t.Fatal("missing document wrapper")
+	}
+	note, ok := protobufBytesField(wrapper, 3)
+	if !ok {
+		t.Fatal("missing note")
+	}
+	fields, err := decodeProtobufFields(note)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var substrings [][]byte
+	for _, field := range fields {
+		if field.number == 3 && field.wire == 2 {
+			substrings = append(substrings, field.payload)
+		}
+	}
+	if len(substrings) < 2 {
+		t.Fatalf("substring count = %d", len(substrings))
+	}
+	live, err := decodeProtobufFields(substrings[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if length := protobufVarintTestField(live, 2); length != 2 {
+		t.Fatalf("UTF-16 character length = %d, want 2", length)
 	}
 }
 
@@ -616,6 +780,62 @@ func resolutionTokens(t *testing.T, fields map[string]FieldValue) map[string]map
 	return envelope.Map
 }
 
+func TestResolutionTokenRepairAdvancesPastSurvivingClock(t *testing.T) {
+	t.Parallel()
+
+	title, err := encodeTitleDocument("Edited title")
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := Record{
+		RecordName: "Reminder/R1",
+		Created:    &Timestamp{Timestamp: 1787596760936},
+		Fields: map[string]FieldValue{
+			"TitleDocument":      {Value: title},
+			"Completed":          {Value: int64(1), Type: "NUMBER_INT64"},
+			"List":               {Value: RecordReference{RecordName: "List/FP"}},
+			"ResolutionTokenMap": {Value: `{"map":{"completed":{"counter":2,"modificationTime":100,"replicaID":"survivor"},"lastModifiedDate":{"counter":2,"modificationTime":100,"replicaID":"survivor"}}}`},
+		},
+	}
+	fields := map[string]FieldValue{"TitleDocument": {Value: title}}
+	if err := addResolutionTokenUpdates(record, fields, "titleDocument"); err != nil {
+		t.Fatal(err)
+	}
+	tokens := resolutionTokens(t, fields)
+	if counter := tokens["titleDocument"]["counter"]; counter != float64(4) {
+		t.Errorf("repaired title counter = %#v, want 4", counter)
+	}
+	for _, key := range []string{"list", "creationDate"} {
+		if counter := tokens[key]["counter"]; counter != float64(3) {
+			t.Errorf("repaired %s counter = %#v, want 3", key, counter)
+		}
+	}
+	if counter := tokens["lastModifiedDate"]["counter"]; counter != float64(3) {
+		t.Errorf("lastModifiedDate counter = %#v, want 3", counter)
+	}
+	if field := fields["CreationDate"]; field.Value != int64(1787596760936) || field.Type != "TIMESTAMP" {
+		t.Errorf("repaired CreationDate = %#v", field)
+	}
+	if field := fields["ResolutionTokenMap"]; field.Type != "STRING" {
+		t.Errorf("repaired ResolutionTokenMap = %#v", field)
+	}
+}
+
+const nativeResolutionTokenMapFixture = `{"map":{"titleDocument":{"counter":7,"modificationTime":100,"replicaID":"native-device"},"list":{"counter":4,"modificationTime":90,"replicaID":"native-device"},"completed":{"counter":3,"modificationTime":80,"replicaID":"native-device"},"lastModifiedDate":{"counter":9,"modificationTime":110,"replicaID":"native-device"}}}`
+
+func assertNativeResolutionTokensPreserved(t *testing.T, fields map[string]FieldValue) {
+	t.Helper()
+	tokens := resolutionTokens(t, fields)
+	for key, counter := range map[string]float64{"titleDocument": 7, "list": 4, "completed": 3} {
+		if token := tokens[key]; token == nil || token["counter"] != counter || token["replicaID"] != "native-device" {
+			t.Errorf("resolution token %q was not preserved: %#v", key, token)
+		}
+	}
+	if token := tokens["lastModifiedDate"]; token == nil || token["counter"] != float64(10) || token["replicaID"] != "native-device" {
+		t.Errorf("lastModifiedDate resolution token = %#v", token)
+	}
+}
+
 func TestCreateTagUsesAtomicLinkedChildContract(t *testing.T) {
 	t.Parallel()
 
@@ -625,7 +845,7 @@ func TestCreateTagUsesAtomicLinkedChildContract(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/zones/list"):
 			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
 		case strings.Contains(r.URL.Path, "/records/lookup"):
-			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"change-1","fields":{"HashtagIDs":{"value":[],"type":"EMPTY_LIST"}}}]}`)
+			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"change-1","fields":{"HashtagIDs":{"value":[],"type":"EMPTY_LIST"},"ResolutionTokenMap":{"value":%q,"type":"STRING"}}}]}`, nativeResolutionTokenMapFixture)
 		case strings.Contains(r.URL.Path, "/records/modify"):
 			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
 				t.Errorf("decode modify request: %v", err)
@@ -669,6 +889,7 @@ func TestCreateTagUsesAtomicLinkedChildContract(t *testing.T) {
 	if tokens.Map["hashtagIDs"] == nil || tokens.Map["lastModifiedDate"] == nil {
 		t.Errorf("resolution tokens = %#v", tokens.Map)
 	}
+	assertNativeResolutionTokensPreserved(t, reminder.Record.Fields)
 	child := modify.Operations[1]
 	if child.OperationType != OperationCreate || child.Record.RecordName != "Hashtag/"+ids[0] {
 		t.Errorf("child operation = %#v", child)
@@ -755,7 +976,7 @@ func TestAssignReminderUsesAtomicLinkedChildContract(t *testing.T) {
 				t.Errorf("decode lookup request: %v", err)
 			}
 			if len(lookup.Records) == 1 && lookup.Records[0].RecordName == "Reminder/R1" {
-				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"List":{"value":{"recordName":"List/SHARED","action":"NONE"}},"AssignmentIDs":{"value":[],"type":"EMPTY_LIST"}}}]}`)
+				_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"List":{"value":{"recordName":"List/SHARED","action":"NONE"}},"AssignmentIDs":{"value":[],"type":"EMPTY_LIST"},"ResolutionTokenMap":{"value":%q,"type":"STRING"}}}]}`, nativeResolutionTokenMapFixture)
 				return
 			}
 			_ = json.NewEncoder(w).Encode(RecordsResponse{Records: []Record{{
@@ -829,6 +1050,7 @@ func TestAssignReminderUsesAtomicLinkedChildContract(t *testing.T) {
 	if tokens.Map["assignmentIDs"] == nil || tokens.Map["lastModifiedDate"] == nil {
 		t.Errorf("resolution tokens = %#v", tokens.Map)
 	}
+	assertNativeResolutionTokensPreserved(t, reminder.Record.Fields)
 }
 
 func TestUnassignReminderUsesNativeDelete(t *testing.T) {
@@ -1018,7 +1240,7 @@ func TestCreateLocationAlarmUsesAtomicAlarmAndTriggerContract(t *testing.T) {
 		case strings.Contains(r.URL.Path, "/zones/list"):
 			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
 		case strings.Contains(r.URL.Path, "/records/lookup"):
-			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AlarmIDs":{"value":[],"type":"EMPTY_LIST"}}}]}`)
+			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AlarmIDs":{"value":[],"type":"EMPTY_LIST"},"ResolutionTokenMap":{"value":%q,"type":"STRING"}}}]}`, nativeResolutionTokenMapFixture)
 		case strings.Contains(r.URL.Path, "/records/modify"):
 			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
 				t.Errorf("decode modify request: %v", err)
@@ -1063,6 +1285,7 @@ func TestCreateLocationAlarmUsesAtomicAlarmAndTriggerContract(t *testing.T) {
 	if tokens.Map["alarmIDs"] != nil || tokens.Map["lastModifiedDate"] == nil {
 		t.Errorf("resolution tokens = %#v", tokens.Map)
 	}
+	assertNativeResolutionTokensPreserved(t, reminder.Record.Fields)
 	alarm := modify.Operations[1]
 	if alarm.OperationType != OperationCreate || alarm.Record.RecordName != "Alarm/"+alarmIDs[0] {
 		t.Errorf("alarm operation = %#v", alarm)
@@ -1223,6 +1446,76 @@ func TestClearDueDateDeletesOnlyDateAlarm(t *testing.T) {
 	}
 	if modify.Operations[1].Record.RecordName != "AlarmTrigger/TD" || modify.Operations[2].Record.RecordName != "Alarm/DATE" {
 		t.Errorf("delete operations = %#v", modify.Operations[1:])
+	}
+}
+
+func TestCreateRecurrenceRejectsClearedDueDate(t *testing.T) {
+	t.Parallel()
+
+	modifyCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"DueDate":{"value":null,"type":"TIMESTAMP"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			modifyCalled = true
+			_ = json.NewEncoder(w).Encode(RecordsResponse{})
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	err = service.UpdateRecurrence("Reminder/R1", &RecurrenceRule{Frequency: 1, Interval: 1})
+	if err == nil || !strings.Contains(err.Error(), "valid due date") {
+		t.Fatalf("UpdateRecurrence error = %v", err)
+	}
+	if modifyCalled {
+		t.Fatal("recurrence mutation was submitted for a cleared due date")
+	}
+}
+
+func TestUpdateEarlyReminderRejectsClearedDueDate(t *testing.T) {
+	t.Parallel()
+
+	baseline, err := json.Marshal(dueDateDeltaAlertsEnvelope{AccountIdentifier: "account-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	modifyCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"DueDate":{"value":null,"type":"TIMESTAMP"},"DueDateDeltaAlertsData":{"value":%q,"type":"ENCRYPTED_BYTES"}}}]}`, base64.StdEncoding.EncodeToString(baseline))
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			modifyCalled = true
+			_ = json.NewEncoder(w).Encode(RecordsResponse{})
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	err = service.UpdateEarlyReminder("Reminder/R1", &EarlyReminder{Unit: 0, Count: 15})
+	if err == nil || !strings.Contains(err.Error(), "valid due date") {
+		t.Fatalf("UpdateEarlyReminder error = %v", err)
+	}
+	if modifyCalled {
+		t.Fatal("early reminder mutation was submitted for a cleared due date")
 	}
 }
 
@@ -1723,6 +2016,53 @@ func assertCRDTDocumentContains(t *testing.T, encoded, title string) {
 	if strings.Count(string(decompressed), "\x1a") < 3 {
 		t.Errorf("CRDT document does not contain three operations: %x", decompressed)
 	}
+}
+
+func assertMergeableStringLengths(t *testing.T, encoded string) {
+	t.Helper()
+	wantLength, liveLength, attributeLength := mergeableStringLengths(t, encoded)
+	if liveLength != wantLength || attributeLength != wantLength {
+		t.Fatalf("mergeable string lengths: text=%d live=%d attribute=%d", wantLength, liveLength, attributeLength)
+	}
+}
+
+func mergeableStringLengths(t *testing.T, encoded string) (uint64, uint64, uint64) {
+	t.Helper()
+	raw := decodeCRDTTestDocument(t, encoded)
+	wrapper, ok := protobufBytesField(raw, 2)
+	if !ok {
+		t.Fatal("missing document wrapper")
+	}
+	note, ok := protobufBytesField(wrapper, 3)
+	if !ok {
+		t.Fatal("missing note")
+	}
+	fields, err := decodeProtobufFields(note)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, _ := protobufBytesValue(fields, 2)
+	wantLength := uint64(len(utf16.Encode([]rune(string(text)))))
+	var liveLength, attributeLength uint64
+	for _, field := range fields {
+		switch {
+		case field.number == 3 && field.wire == 2:
+			substring, err := decodeProtobufFields(field.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !protobufBoolField(substring, 4) {
+				liveLength += protobufVarintValue(substring, 2)
+			}
+		case field.number == 5 && field.wire == 2:
+			attribute, err := decodeProtobufFields(field.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attributeLength = protobufVarintValue(attribute, 1)
+		}
+	}
+	return wantLength, liveLength, attributeLength
 }
 
 func decodeCRDTTestDocument(t *testing.T, encoded string) []byte {

@@ -142,7 +142,9 @@ Content-Type: application/json
     "desiredKeys": [
       "TitleDocument", "NotesDocument", "Name", "Completed",
       "CompletionDate", "DueDate", "List", "Deleted", "Priority",
-      "ParentReminder", "CreationDate", "LastModifiedDate"
+      "ParentReminder", "Flagged", "CreationDate", "LastModifiedDate",
+      "ResolutionTokenMap", "UrgentPresentationAlarmsAsData",
+      "UrgentPresentationAlarmsChecksum", "DueDateDeltaAlertsData"
     ],
     "syncToken": "<previous-token>"
   }]
@@ -171,11 +173,20 @@ Content-Type: application/json
       "recordName": "Reminder/<UPPERCASE-UUID>",
       "fields": {
         "TitleDocument": {"value": "<base64-gzip-crdt>"},
-        "Completed": {"value": 0},
+        "Completed": {"value": 0, "type": "NUMBER_INT64"},
+        "CreationDate": {"value": 1787601000000, "type": "TIMESTAMP"},
+        "LastModifiedDate": {"value": 1787601000000, "type": "TIMESTAMP"},
+        "Priority": {"value": 0, "type": "NUMBER_INT64"},
+        "Flagged": {"value": 0, "type": "NUMBER_INT64"},
+        "AllDay": {"value": 0, "type": "NUMBER_INT64"},
         "List": {"value": {
           "recordName": "<exact-list-record-name>",
           "action": "NONE"
-        }}
+        }},
+        "ResolutionTokenMap": {
+          "value": "<JSON map containing titleDocument, completed, creationDate, lastModifiedDate, priority, flagged, allDay, list, minimumSupportedVersion, and icsDisplayOrder tokens>",
+          "type": "STRING"
+        }
       }
     }
   }]
@@ -187,7 +198,10 @@ they are not plain strings and do not use the legacy minimal protobuf encoding.
 New reminder records use the native `Reminder/<UUID>` format. This prefix is
 required for parent/subtask relationships to synchronize correctly. Preserve
 exact record names returned by the server, preserve exact list record names,
-and do not force CloudKit field types in the request.
+and follow native typing: integer state fields use `NUMBER_INT64`, dates use
+`TIMESTAMP`, and `ResolutionTokenMap` uses `STRING`. Document and reference
+fields (`TitleDocument`, `NotesDocument`, `List`, and `ParentReminder`) retain
+their native inferred representation without a forced type.
 
 To create a subtask, add a `ParentReminder` reference to a parent in the same
 list:
@@ -212,8 +226,13 @@ First use `records/lookup` to obtain the current `recordChangeTag`, then send an
     "recordName": "<exact-record-name>",
     "recordChangeTag": "<current-change-tag>",
     "fields": {
-      "Priority": {"value": 5},
-      "DueDate": {"value": 1787487524290}
+      "Priority": {"value": 5, "type": "NUMBER_INT64"},
+      "DueDate": {"value": 1787487524290, "type": "TIMESTAMP"},
+      "LastModifiedDate": {"value": 1787601000000, "type": "TIMESTAMP"},
+      "ResolutionTokenMap": {
+        "value": "<preserved map with priority, dueDate, and lastModifiedDate advanced>",
+        "type": "STRING"
+      }
     }
   }
 }
@@ -222,9 +241,19 @@ First use `records/lookup` to obtain the current `recordChangeTag`, then send an
 Priority, due-date, title, and notes updates are live-tested. Text updates must
 edit the existing CRDT document rather than submit a new snapshot. The writer
 uses a stable client replica, tombstones the previous live substring, preserves
-the existing operation history, and advances its logical timestamp beyond all
-other observed replicas. A fresh concurrent snapshot can otherwise be ignored
-or concatenated with the native value.
+the existing operation history, and maintains two distinct clocks. Character
+clocks are local to each replica: a new replica starts at character clock zero,
+while a known replica continues from its own character vector clock. Tombstone
+timestamps are logical/vector timestamps and advance beyond the other observed
+replicas. Borrowing another replica's character clock or submitting a fresh
+snapshot creates a concurrent branch that Reminders can ignore or concatenate
+with the native value.
+
+Every scalar or document update preserves the complete existing
+`ResolutionTokenMap`, advances the token for each changed property, and advances
+`lastModifiedDate`. If a legacy partial map is encountered, missing tokens for
+present core fields are recovered above the largest surviving counter before
+the requested property is advanced.
 
 Completion is live-tested with `Completed` as `NUMBER_INT64` and
 `CompletionDate` and `LastModifiedDate` as `TIMESTAMP`. The same update advances

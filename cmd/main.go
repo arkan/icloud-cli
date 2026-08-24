@@ -1122,11 +1122,9 @@ func (c *AddCmd) Run() error {
 		if err != nil {
 			return err
 		}
-		for _, l := range lists {
-			if strings.EqualFold(l.Title, c.List) || l.GUID == c.List {
-				listGUID = l.GUID
-				break
-			}
+		listGUID, err = resolveReminderList(lists, c.List)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -1178,6 +1176,15 @@ func (c *AddCmd) Run() error {
 
 	color.Green("✓ Added: %s", c.Title)
 	return nil
+}
+
+func resolveReminderList(lists []reminders.Collection, selector string) (string, error) {
+	for _, list := range lists {
+		if strings.EqualFold(list.Title, selector) || list.GUID == selector {
+			return list.GUID, nil
+		}
+	}
+	return "", fmt.Errorf("list not found: %s", selector)
 }
 
 func parseDueDate(s string, location *time.Location) (time.Time, bool, error) {
