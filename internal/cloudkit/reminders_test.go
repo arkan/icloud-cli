@@ -93,6 +93,99 @@ func TestAddReminderUsesRemindersCloudKitContract(t *testing.T) {
 	assertCRDTDocumentContains(t, titleField.Value.(string), "Café 🛒")
 }
 
+func TestGetReminderRecordReturnsExactCloudKitRecord(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"change","fields":{"Flagged":{"value":1,"type":"NUMBER_INT64"}}}]}`)
+		default:
+			http.Error(w, "unexpected path", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := newRemindersService(client, "").GetReminderRecord("Reminder/R1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.RecordName != "Reminder/R1" || record.RecordChangeTag != "change" || !fieldBool(record.Fields["Flagged"].Value) {
+		t.Fatalf("raw record = %#v", record)
+	}
+}
+
+func TestGetReminderPropertiesResolvesLinkedRecords(t *testing.T) {
+	t.Parallel()
+	earlyData, err := json.Marshal(dueDateDeltaAlertsEnvelope{DueDateDeltaAlerts: []dueDateDeltaAlertData{{DueDateDeltaCount: -15, DueDateDeltaUnit: 0}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/zones/list") {
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner"}}]}`)
+			return
+		}
+		if !strings.Contains(r.URL.Path, "/records/lookup") {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		var request LookupRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		name := request.Records[0].RecordName
+		var record Record
+		switch {
+		case name == "Reminder/R1":
+			record = Record{RecordName: name, RecordType: "Reminder", Fields: map[string]FieldValue{
+				"AttachmentIDs": {Value: []interface{}{"A1"}}, "HashtagIDs": {Value: []interface{}{"H1"}},
+				"AssignmentIDs": {Value: []interface{}{"S1"}}, "RecurrenceRuleIDs": {Value: []interface{}{"RR1"}},
+				"AlarmIDs": {Value: []interface{}{"AL1"}}, "TimeZone": {Value: "Europe/Paris"}, "AllDay": {Value: float64(0)},
+				"DueDateDeltaAlertsData": {Value: base64.StdEncoding.EncodeToString(earlyData)},
+			}}
+		case strings.HasPrefix(name, "Attachment/"):
+			record = Record{RecordName: name, Fields: map[string]FieldValue{"Type": {Value: "URL"}, "URL": {Value: "https://example.com"}}}
+		case strings.HasPrefix(name, "Hashtag/"):
+			record = Record{RecordName: name, Fields: map[string]FieldValue{"Name": {Value: "work"}}}
+		case strings.HasPrefix(name, "Assignment/"):
+			record = Record{RecordName: name, Fields: map[string]FieldValue{"EncryptedAssigneeIdentifier": {Value: "participant"}}}
+		case strings.HasPrefix(name, "RecurrenceRule/"):
+			record = Record{RecordName: name, Fields: map[string]FieldValue{"Frequency": {Value: float64(1)}, "Interval": {Value: float64(2)}}}
+		case strings.HasPrefix(name, "Alarm/"):
+			record = Record{RecordName: name, Fields: map[string]FieldValue{"TriggerID": {Value: "T1"}}}
+		case strings.HasPrefix(name, "AlarmTrigger/"):
+			record = Record{RecordName: name, Fields: map[string]FieldValue{"Type": {Value: "Location"}, "Title": {Value: "Office"}, "Address": {Value: "1 Main St"}, "Latitude": {Value: 48.0}, "Longitude": {Value: 2.0}, "Radius": {Value: 100.0}, "Proximity": {Value: float64(1)}}}
+		}
+		record.RecordChangeTag = "change"
+		_ = json.NewEncoder(w).Encode(RecordsResponse{Records: []Record{record}})
+	}))
+	defer server.Close()
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	properties, err := newRemindersService(client, "").GetReminderProperties("Reminder/R1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if properties.URL != "https://example.com" || len(properties.Tags) != 1 || properties.Tags[0] != "work" || properties.Assignee != "participant" {
+		t.Fatalf("linked properties = %#v", properties)
+	}
+	if properties.Recurrence == nil || properties.Recurrence.Frequency != 1 || properties.Recurrence.Interval != 2 || properties.EarlyReminder == nil || properties.EarlyReminder.Count != 15 {
+		t.Fatalf("scheduled properties = %#v", properties)
+	}
+	if properties.Location == nil || properties.Location.Title != "Office" || properties.Location.Proximity != 1 {
+		t.Fatalf("location = %#v", properties.Location)
+	}
+}
+
 func TestAddReminderWithParentUsesParentsList(t *testing.T) {
 	t.Parallel()
 

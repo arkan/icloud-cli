@@ -169,6 +169,7 @@ type RemindersCmd struct {
 	Sharees ShareesCmd `cmd:"" help:"List accepted participants of a shared list"`
 	Add     AddCmd     `cmd:"" help:"Add a new reminder"`
 	Edit    EditCmd    `cmd:"" help:"Edit a reminder"`
+	Show    ShowCmd    `cmd:"" help:"Show reminder details"`
 	Done    DoneCmd    `cmd:"" help:"Mark a reminder as done"`
 	Rm      RmCmd      `cmd:"" help:"Delete a reminder"`
 }
@@ -508,12 +509,28 @@ func resolveReminderID(svc *reminders.Service, id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	item, err := findReminderByID(items, id)
+	if err != nil {
+		return "", err
+	}
+	return item.RecordName, nil
+}
+
+func findReminderByID(items []reminders.ParsedReminder, id string) (reminders.ParsedReminder, error) {
+	query := strings.ToLower(id)
+	var matches []reminders.ParsedReminder
 	for _, item := range items {
-		if strings.HasPrefix(strings.ToLower(item.GUID), strings.ToLower(id)) {
-			return item.RecordName, nil
+		if strings.HasPrefix(strings.ToLower(item.GUID), query) || strings.EqualFold(item.RecordName, id) {
+			matches = append(matches, item)
 		}
 	}
-	return "", fmt.Errorf("reminder not found: %s", id)
+	if len(matches) == 0 {
+		return reminders.ParsedReminder{}, fmt.Errorf("reminder not found: %s", id)
+	}
+	if len(matches) > 1 {
+		return reminders.ParsedReminder{}, fmt.Errorf("multiple reminders match %q; use a longer ID", id)
+	}
+	return matches[0], nil
 }
 
 // ListsCmd lists all reminder lists
@@ -718,6 +735,347 @@ func shortReminderID(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+type reminderShowView struct {
+	Reminder   reminders.ParsedReminder
+	ListName   string
+	Parent     *reminders.ParsedReminder
+	Subtasks   []reminders.ParsedReminder
+	Properties cloudkit.ReminderProperties
+}
+
+// ShowCmd displays one reminder selected by full ID or unique prefix.
+type ShowCmd struct {
+	ID      string `arg:"" help:"Reminder ID (unique prefix or full ID)"`
+	JSON    bool   `help:"Show stable JSON output"`
+	Raw     bool   `help:"Show the raw CloudKit record as JSON"`
+	NoColor bool   `name:"no-color" help:"Disable colors in human-readable output"`
+}
+
+func (c *ShowCmd) Run() error {
+	if c.JSON && c.Raw {
+		return fmt.Errorf("--json and --raw are mutually exclusive")
+	}
+	svc, err := getRemindersService()
+	if err != nil {
+		return err
+	}
+	items, err := svc.GetReminders("", true)
+	if err != nil {
+		return fmt.Errorf("get reminders: %w", err)
+	}
+	selected, err := findReminderByID(items, c.ID)
+	if err != nil {
+		return err
+	}
+	if c.Raw {
+		record, err := svc.GetRawReminder(selected.RecordName)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(record)
+	}
+
+	view := buildReminderShowView(selected, items)
+	properties, err := svc.GetReminderProperties(selected.RecordName)
+	if err != nil {
+		return err
+	}
+	view.Properties = properties
+	lists, err := svc.GetLists()
+	if err != nil {
+		return fmt.Errorf("get lists: %w", err)
+	}
+	for _, list := range lists {
+		if list.GUID == selected.ListGUID {
+			view.ListName = list.Title
+			break
+		}
+	}
+	if view.ListName == "" {
+		view.ListName = selected.ListGUID
+	}
+	if view.Properties.Assignee != "" {
+		if sharees, shareErr := svc.GetSharees(selected.ListGUID); shareErr == nil {
+			for _, sharee := range sharees {
+				if sharee.ParticipantID != view.Properties.Assignee {
+					continue
+				}
+				name := sharee.DisplayName
+				if name == "" {
+					name = sharee.Email
+				}
+				if sharee.CurrentUser {
+					name += " (me)"
+				}
+				if name != "" {
+					view.Properties.Assignee = name
+				}
+				break
+			}
+		}
+	}
+	if c.JSON {
+		return renderReminderShowJSON(os.Stdout, view)
+	}
+	renderReminderShowText(os.Stdout, view, c.NoColor)
+	return nil
+}
+
+func buildReminderShowView(selected reminders.ParsedReminder, items []reminders.ParsedReminder) reminderShowView {
+	view := reminderShowView{Reminder: selected}
+	for index := range items {
+		item := &items[index]
+		if item.RecordName == selected.ParentRecordName {
+			view.Parent = item
+		}
+		if item.ParentRecordName == selected.RecordName {
+			view.Subtasks = append(view.Subtasks, *item)
+		}
+	}
+	return view
+}
+
+type reminderShowJSON struct {
+	ID             string                     `json:"id"`
+	RecordName     string                     `json:"recordName"`
+	Title          string                     `json:"title"`
+	Notes          string                     `json:"notes"`
+	List           string                     `json:"list"`
+	Parent         *reminderShowJSONReference `json:"parent"`
+	Completed      bool                       `json:"completed"`
+	CompletionDate *time.Time                 `json:"completionDate"`
+	Priority       string                     `json:"priority"`
+	Flagged        bool                       `json:"flagged"`
+	Due            *time.Time                 `json:"due"`
+	CreatedDate    *time.Time                 `json:"createdDate"`
+	ModifiedDate   *time.Time                 `json:"modifiedDate"`
+	URL            string                     `json:"url"`
+	Tags           []string                   `json:"tags"`
+	Assigned       string                     `json:"assigned"`
+	TimeZone       string                     `json:"timeZone"`
+	AllDay         bool                       `json:"allDay"`
+	Location       *reminderShowJSONLocation  `json:"location"`
+	Repeat         string                     `json:"repeat"`
+	Early          string                     `json:"earlyReminder"`
+	Urgent         *bool                      `json:"urgent"`
+	Subtasks       []reminderShowJSONSummary  `json:"subtasks"`
+}
+
+type reminderShowJSONReference struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+type reminderShowJSONSummary struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Completed bool   `json:"completed"`
+}
+
+type reminderShowJSONLocation struct {
+	Title     string  `json:"title,omitempty"`
+	Address   string  `json:"address,omitempty"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Radius    float64 `json:"radius"`
+	Proximity string  `json:"proximity"`
+}
+
+func renderReminderShowJSON(writer io.Writer, view reminderShowView) error {
+	document := reminderShowJSON{
+		ID: view.Reminder.GUID, RecordName: view.Reminder.RecordName,
+		Title: view.Reminder.Title, Notes: view.Reminder.Description, List: view.ListName,
+		Completed: view.Reminder.Completed, CompletionDate: view.Reminder.CompletionDate,
+		Priority: reminderPriorityName(view.Reminder.Priority),
+		Flagged:  view.Reminder.Flagged, Due: view.Reminder.DueDate,
+		URL: view.Properties.URL, Tags: append([]string{}, view.Properties.Tags...),
+		Assigned: view.Properties.Assignee, TimeZone: view.Properties.TimeZone,
+		AllDay: view.Properties.AllDay,
+		Repeat: formatRecurrence(view.Properties.Recurrence), Early: formatEarlyReminder(view.Properties.EarlyReminder),
+		Urgent:   view.Properties.Urgent,
+		Subtasks: make([]reminderShowJSONSummary, 0, len(view.Subtasks)),
+	}
+	if location := view.Properties.Location; location != nil {
+		document.Location = &reminderShowJSONLocation{
+			Title: location.Title, Address: location.Address, Latitude: location.Latitude,
+			Longitude: location.Longitude, Radius: location.Radius,
+			Proximity: map[int]string{1: "arriving", 2: "leaving"}[location.Proximity],
+		}
+	}
+	if !view.Reminder.CreatedDate.IsZero() {
+		document.CreatedDate = &view.Reminder.CreatedDate
+	}
+	if !view.Reminder.ModifiedDate.IsZero() {
+		document.ModifiedDate = &view.Reminder.ModifiedDate
+	}
+	if view.Parent != nil {
+		document.Parent = &reminderShowJSONReference{ID: view.Parent.GUID, Title: view.Parent.Title}
+	}
+	for _, subtask := range view.Subtasks {
+		document.Subtasks = append(document.Subtasks, reminderShowJSONSummary{
+			ID: subtask.GUID, Title: subtask.Title, Completed: subtask.Completed,
+		})
+	}
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(document)
+}
+
+func reminderPriorityName(priority int) string {
+	if name, ok := map[int]string{0: "none", 1: "high", 5: "medium", 9: "low"}[priority]; ok {
+		return name
+	}
+	return strconv.Itoa(priority)
+}
+
+func renderReminderShowText(writer io.Writer, view reminderShowView, noColor bool) {
+	label := func(value string) string {
+		style := color.New(color.Bold)
+		if noColor {
+			style.DisableColor()
+		}
+		return style.Sprint(value)
+	}
+	value := func(text string) string {
+		style := color.New(color.FgCyan)
+		if noColor {
+			style.DisableColor()
+		}
+		return style.Sprint(text)
+	}
+	yesNo := func(enabled bool) string {
+		if enabled {
+			return "yes"
+		}
+		return "no"
+	}
+	orDash := func(text string) string {
+		if text == "" {
+			return "—"
+		}
+		return text
+	}
+	priority := reminderPriorityName(view.Reminder.Priority)
+
+	fmt.Fprintf(writer, "%s %s\n", label("Title:     "), value(view.Reminder.Title))
+	fmt.Fprintf(writer, "%s %s\n", label("ID:        "), view.Reminder.GUID)
+	fmt.Fprintf(writer, "%s %s\n", label("List:      "), view.ListName)
+	parent := "—"
+	if view.Parent != nil {
+		parent = fmt.Sprintf("%s (%s)", view.Parent.Title, shortReminderID(view.Parent.GUID))
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Parent:    "), parent)
+	fmt.Fprintf(writer, "%s %s\n", label("Completed: "), yesNo(view.Reminder.Completed))
+	completedAt := "—"
+	if view.Reminder.CompletionDate != nil {
+		completedAt = view.Reminder.CompletionDate.Format(time.RFC3339)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Completed at:"), completedAt)
+	fmt.Fprintf(writer, "%s %s\n", label("Priority:  "), priority)
+	fmt.Fprintf(writer, "%s %s\n", label("Flagged:   "), yesNo(view.Reminder.Flagged))
+	due := "—"
+	if view.Reminder.DueDate != nil {
+		due = view.Reminder.DueDate.Format("2006-01-02 15:04 MST")
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Due:       "), due)
+	fmt.Fprintf(writer, "%s %s\n", label("Timezone:  "), orDash(view.Properties.TimeZone))
+	allDay := "—"
+	if view.Reminder.DueDate != nil {
+		allDay = yesNo(view.Properties.AllDay)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("All day:   "), allDay)
+	fmt.Fprintf(writer, "%s %s\n", label("URL:       "), orDash(view.Properties.URL))
+	fmt.Fprintf(writer, "%s %s\n", label("Tags:      "), orDash(strings.Join(view.Properties.Tags, ", ")))
+	fmt.Fprintf(writer, "%s %s\n", label("Assigned:  "), orDash(view.Properties.Assignee))
+	locationText := "—"
+	if location := view.Properties.Location; location != nil {
+		proximity := map[int]string{1: "arriving", 2: "leaving"}[location.Proximity]
+		locationText = location.Title
+		if locationText == "" {
+			locationText = location.Address
+		} else if location.Address != "" {
+			locationText += " — " + location.Address
+		}
+		if proximity != "" {
+			locationText += " (" + proximity + ")"
+		}
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Location:  "), locationText)
+	fmt.Fprintf(writer, "%s %s\n", label("Repeat:    "), orDash(formatRecurrence(view.Properties.Recurrence)))
+	fmt.Fprintf(writer, "%s %s\n", label("Early:     "), orDash(formatEarlyReminder(view.Properties.EarlyReminder)))
+	urgent := "—"
+	if view.Properties.Urgent != nil {
+		urgent = yesNo(*view.Properties.Urgent)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Urgent:    "), urgent)
+	created := "—"
+	if !view.Reminder.CreatedDate.IsZero() {
+		created = view.Reminder.CreatedDate.Format(time.RFC3339)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Created:   "), created)
+	modified := "—"
+	if !view.Reminder.ModifiedDate.IsZero() {
+		modified = view.Reminder.ModifiedDate.Format(time.RFC3339)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Modified:  "), modified)
+	if view.Reminder.Description != "" {
+		fmt.Fprintf(writer, "%s\n  %s\n", label("Notes:"), view.Reminder.Description)
+	} else {
+		fmt.Fprintf(writer, "%s %s\n", label("Notes:     "), "—")
+	}
+	if len(view.Subtasks) > 0 {
+		fmt.Fprintf(writer, "%s\n", label("Subtasks:"))
+		for index, subtask := range view.Subtasks {
+			branch := "├─"
+			if index == len(view.Subtasks)-1 {
+				branch = "└─"
+			}
+			marker := "○"
+			if subtask.Completed {
+				marker = "✓"
+			}
+			fmt.Fprintf(writer, "  %s %s %s (%s)\n", branch, marker, subtask.Title, shortReminderID(subtask.GUID))
+		}
+	} else {
+		fmt.Fprintf(writer, "%s %s\n", label("Subtasks:  "), "—")
+	}
+}
+
+func formatRecurrence(rule *cloudkit.RecurrenceRule) string {
+	if rule == nil {
+		return ""
+	}
+	unit := map[int]string{0: "day", 1: "week", 2: "month", 3: "year"}[rule.Frequency]
+	if unit == "" {
+		unit = "unknown"
+	}
+	interval := rule.Interval
+	if interval < 1 {
+		interval = 1
+	}
+	text := "every " + unit
+	if interval > 1 {
+		text = fmt.Sprintf("every %d %ss", interval, unit)
+	}
+	if rule.EndDate != nil {
+		text += " until " + rule.EndDate.Format("2006-01-02")
+	}
+	return text
+}
+
+func formatEarlyReminder(alert *cloudkit.EarlyReminder) string {
+	if alert == nil {
+		return ""
+	}
+	unit := map[int]string{0: "minute", 1: "hour", 2: "day", 3: "week", 4: "month"}[alert.Unit]
+	if alert.Count != 1 {
+		unit += "s"
+	}
+	return fmt.Sprintf("%d %s", alert.Count, unit)
 }
 
 func formatDueDate(t time.Time) string {

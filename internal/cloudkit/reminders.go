@@ -57,17 +57,18 @@ type ReminderSharee struct {
 
 // ReminderItem represents a single reminder
 type ReminderItem struct {
-	ID           string
-	ListID       string
-	ParentID     string
-	Title        string
-	Notes        string
-	Priority     int
-	Flagged      bool
-	Completed    bool
-	DueDate      *time.Time
-	CreatedDate  time.Time
-	ModifiedDate time.Time
+	ID             string
+	ListID         string
+	ParentID       string
+	Title          string
+	Notes          string
+	Priority       int
+	Flagged        bool
+	Completed      bool
+	CompletionDate *time.Time
+	DueDate        *time.Time
+	CreatedDate    time.Time
+	ModifiedDate   time.Time
 }
 
 // ReminderChanges contains the fields to update. Nil pointers are unchanged.
@@ -76,6 +77,19 @@ type ReminderChanges struct {
 	Notes    *string
 	Priority *int
 	Flagged  *bool
+}
+
+// ReminderProperties contains native properties stored in linked CloudKit records.
+type ReminderProperties struct {
+	URL           string
+	Tags          []string
+	Assignee      string
+	TimeZone      string
+	AllDay        bool
+	Location      *LocationAlarm
+	Recurrence    *RecurrenceRule
+	EarlyReminder *EarlyReminder
+	Urgent        *bool
 }
 
 // DueDateChange describes a native due date. A nil change clears the due date.
@@ -393,6 +407,12 @@ func (s *RemindersService) parseReminder(r Record) ReminderItem {
 	if f, ok := r.Fields["Completed"]; ok {
 		item.Completed = fieldBool(f.Value)
 	}
+	if f, ok := r.Fields["CompletionDate"]; ok {
+		if value, ok := numericInt64(f.Value); ok {
+			date := time.UnixMilli(value)
+			item.CompletionDate = &date
+		}
+	}
 
 	if f, ok := r.Fields["Priority"]; ok {
 		if v, ok := f.Value.(float64); ok {
@@ -433,6 +453,156 @@ func (s *RemindersService) parseReminder(r Record) ReminderItem {
 	}
 
 	return item
+}
+
+// GetReminderRecord returns the exact CloudKit record for a reminder.
+func (s *RemindersService) GetReminderRecord(reminderID string) (Record, error) {
+	if err := s.ensureZone(); err != nil {
+		return Record{}, err
+	}
+	return s.lookupReminder(reminderID)
+}
+
+// GetReminderProperties resolves native properties stored on linked records.
+func (s *RemindersService) GetReminderProperties(reminderID string) (ReminderProperties, error) {
+	record, err := s.GetReminderRecord(reminderID)
+	if err != nil {
+		return ReminderProperties{}, err
+	}
+	var properties ReminderProperties
+	properties.TimeZone, _ = record.Fields["TimeZone"].Value.(string)
+	properties.AllDay = fieldBool(record.Fields["AllDay"].Value)
+	if field, ok := record.Fields["DueDateDeltaAlertsData"]; ok {
+		if encoded, ok := field.Value.(string); ok {
+			if raw, decodeErr := base64.StdEncoding.DecodeString(encoded); decodeErr == nil {
+				var envelope dueDateDeltaAlertsEnvelope
+				if json.Unmarshal(raw, &envelope) == nil && len(envelope.DueDateDeltaAlerts) > 0 {
+					alert := envelope.DueDateDeltaAlerts[0]
+					properties.EarlyReminder = &EarlyReminder{Unit: alert.DueDateDeltaUnit, Count: absInt(alert.DueDateDeltaCount)}
+				}
+			}
+		}
+	}
+	if _, exists := record.Fields["UrgentPresentationAlarmsAsData"]; exists {
+		enabled := false
+		if envelope, ok := s.decodeUrgentPresentationEnvelope(record); ok {
+			for _, account := range envelope.Account {
+				enabled = enabled || account.IsEnabled
+			}
+		}
+		properties.Urgent = &enabled
+	}
+
+	attachmentIDs := fieldStringList(record.Fields["AttachmentIDs"].Value)
+	attachments, err := s.lookupRelatedRecords("Attachment/", attachmentIDs)
+	if err != nil {
+		return ReminderProperties{}, fmt.Errorf("lookup reminder attachments: %w", err)
+	}
+	for _, attachment := range attachments {
+		if attachment.Fields["Type"].Value == "URL" {
+			properties.URL = decodeCloudKitText(attachment.Fields["URL"])
+		}
+	}
+
+	hashtags, err := s.lookupRelatedRecords("Hashtag/", fieldStringList(record.Fields["HashtagIDs"].Value))
+	if err != nil {
+		return ReminderProperties{}, fmt.Errorf("lookup reminder tags: %w", err)
+	}
+	for _, hashtag := range hashtags {
+		if name := decodeCloudKitText(hashtag.Fields["Name"]); name != "" {
+			properties.Tags = append(properties.Tags, name)
+		}
+	}
+
+	assignments, err := s.lookupRelatedRecords("Assignment/", fieldStringList(record.Fields["AssignmentIDs"].Value))
+	if err != nil {
+		return ReminderProperties{}, fmt.Errorf("lookup reminder assignments: %w", err)
+	}
+	if len(assignments) > 0 {
+		properties.Assignee = decodeCloudKitText(assignments[0].Fields["EncryptedAssigneeIdentifier"])
+	}
+
+	rules, err := s.lookupRelatedRecords("RecurrenceRule/", fieldStringList(record.Fields["RecurrenceRuleIDs"].Value))
+	if err != nil {
+		return ReminderProperties{}, fmt.Errorf("lookup reminder recurrence: %w", err)
+	}
+	if len(rules) > 0 {
+		frequency, _ := numericInt64(rules[0].Fields["Frequency"].Value)
+		interval, _ := numericInt64(rules[0].Fields["Interval"].Value)
+		recurrence := &RecurrenceRule{Frequency: int(frequency), Interval: int(interval)}
+		if end, ok := numericInt64(rules[0].Fields["EndDate"].Value); ok {
+			date := time.UnixMilli(end)
+			recurrence.EndDate = &date
+		}
+		properties.Recurrence = recurrence
+	}
+
+	alarms, err := s.lookupRelatedRecords("Alarm/", fieldStringList(record.Fields["AlarmIDs"].Value))
+	if err != nil {
+		return ReminderProperties{}, fmt.Errorf("lookup reminder alarms: %w", err)
+	}
+	var triggerIDs []string
+	for _, alarm := range alarms {
+		if id, ok := alarm.Fields["TriggerID"].Value.(string); ok && id != "" {
+			triggerIDs = append(triggerIDs, id)
+		}
+	}
+	triggers, err := s.lookupRelatedRecords("AlarmTrigger/", triggerIDs)
+	if err != nil {
+		return ReminderProperties{}, fmt.Errorf("lookup reminder alarm triggers: %w", err)
+	}
+	for _, trigger := range triggers {
+		if trigger.Fields["Type"].Value != "Location" {
+			continue
+		}
+		latitude, _ := numericFloat64(trigger.Fields["Latitude"].Value)
+		longitude, _ := numericFloat64(trigger.Fields["Longitude"].Value)
+		radius, _ := numericFloat64(trigger.Fields["Radius"].Value)
+		proximity, _ := numericInt64(trigger.Fields["Proximity"].Value)
+		properties.Location = &LocationAlarm{Title: decodeCloudKitText(trigger.Fields["Title"]), Address: decodeCloudKitText(trigger.Fields["Address"]), Latitude: latitude, Longitude: longitude, Radius: radius, Proximity: int(proximity)}
+		break
+	}
+	return properties, nil
+}
+
+func (s *RemindersService) lookupRelatedRecords(prefix string, ids []string) ([]Record, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(ids))
+	for _, id := range ids {
+		names = append(names, prefix+id)
+	}
+	response, err := s.client.LookupRecords(RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, names)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range response.Records {
+		if err := recordError(record); err != nil {
+			return nil, err
+		}
+	}
+	return response.Records, nil
+}
+
+func numericFloat64(value interface{}) (float64, bool) {
+	switch value := value.(type) {
+	case float64:
+		return value, true
+	case int64:
+		return float64(value), true
+	case int:
+		return float64(value), true
+	default:
+		return 0, false
+	}
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func fieldBool(value interface{}) bool {
@@ -2663,8 +2833,7 @@ func newResolutionTokenMap(keys ...string) (string, error) {
 	return string(encoded), err
 }
 
-// CompleteReminder submits the completion fields used by Reminders. CloudKit
-// may reconcile this undocumented mutation back to the previous state.
+// CompleteReminder submits the native completion fields used by Reminders.
 func (s *RemindersService) CompleteReminder(reminderID string) error {
 	if err := s.ensureZone(); err != nil {
 		return err

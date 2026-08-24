@@ -50,6 +50,9 @@ icloud reminders lists
 icloud reminders ls
 icloud reminders ls "Shopping"
 icloud reminders ls --flat "Shopping"
+icloud reminders show ABC12345
+icloud reminders show ABC12345 --json
+icloud reminders show ABC12345 --raw
 
 # Create and mutate reminders
 icloud reminders add "Buy milk" -l "Shopping"
@@ -85,6 +88,15 @@ icloud reminders rm ABC12345
 Reminder commands accept a full CloudKit record name or a unique prefix shown
 by `icloud reminders ls`. Subtasks are displayed below their parent by default;
 use `--flat` to preserve the server order without hierarchy.
+
+`reminders show` displays every supported property of one reminder: list,
+parent, completion state, priority, flag, due date and timezone, URL, tags,
+assignment, location, recurrence, Early Reminder, Urgent state, timestamps,
+notes, and immediate subtasks. Missing values are shown as `—`. `--json`
+provides a stable representation for scripts, including empty or null fields.
+`--raw` prints the underlying CloudKit record, including private undocumented
+fields, and should be handled as sensitive account data. Use `--no-color` for
+deterministic human-readable text.
 
 ## How writes work
 

@@ -44,7 +44,11 @@ type ParsedReminder struct {
 	Description      string
 	DueDate          *time.Time
 	Completed        bool
+	CompletionDate   *time.Time
 	Priority         int
+	Flagged          bool
+	CreatedDate      time.Time
+	ModifiedDate     time.Time
 }
 
 // NewService creates a new Reminders service using CloudKit
@@ -109,13 +113,35 @@ func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]Par
 			Title:            item.Title,
 			Description:      item.Notes,
 			Completed:        item.Completed,
+			CompletionDate:   item.CompletionDate,
 			Priority:         item.Priority,
+			Flagged:          item.Flagged,
+			CreatedDate:      item.CreatedDate,
+			ModifiedDate:     item.ModifiedDate,
 			DueDate:          item.DueDate,
 		}
 		result = append(result, parsed)
 	}
 
 	return result, nil
+}
+
+// GetRawReminder returns the underlying CloudKit record without transformation.
+func (s *Service) GetRawReminder(recordName string) (cloudkit.Record, error) {
+	record, err := s.cloudkitSvc.GetReminderRecord(recordName)
+	if err != nil {
+		return cloudkit.Record{}, fmt.Errorf("get raw reminder: %w", err)
+	}
+	return record, nil
+}
+
+// GetReminderProperties resolves native properties stored on linked records.
+func (s *Service) GetReminderProperties(recordName string) (cloudkit.ReminderProperties, error) {
+	properties, err := s.cloudkitSvc.GetReminderProperties(recordName)
+	if err != nil {
+		return cloudkit.ReminderProperties{}, fmt.Errorf("get reminder properties: %w", err)
+	}
+	return properties, nil
 }
 
 // Add creates a new reminder via CloudKit
