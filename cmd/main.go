@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -548,6 +549,7 @@ func (c *ListsCmd) Run() error {
 type LsCmd struct {
 	List string `arg:"" optional:"" help:"List name or GUID (default: all)"`
 	All  bool   `short:"a" help:"Include completed reminders"`
+	Flat bool   `help:"Show subtasks as a flat list"`
 }
 
 func (c *LsCmd) Run() error {
@@ -584,49 +586,138 @@ func (c *LsCmd) Run() error {
 		return nil
 	}
 
-	fmt.Println()
-	for _, r := range reminders {
-		bullet := "○"
-		titleColor := color.New(color.FgWhite)
-		if r.Completed {
-			bullet = "✓"
-			titleColor = color.New(color.FgHiBlack, color.CrossedOut)
-		}
-
-		// Priority indicator
-		priority := ""
-		switch r.Priority {
-		case 1:
-			priority = color.RedString(" !!!")
-		case 5:
-			priority = color.YellowString(" !!")
-		case 9:
-			priority = color.BlueString(" !")
-		}
-
-		fmt.Printf("  %s %s%s\n", bullet, titleColor.Sprint(r.Title), priority)
-
-		// Due date
-		if r.DueDate != nil {
-			dueStr := formatDueDate(*r.DueDate)
-			if r.DueDate.Before(time.Now()) && !r.Completed {
-				fmt.Printf("    %s\n", color.RedString("⏰ %s (overdue)", dueStr))
-			} else {
-				fmt.Printf("    %s\n", color.HiBlackString("⏰ %s", dueStr))
-			}
-		}
-
-		// Description
-		if r.Description != "" {
-			fmt.Printf("    %s\n", color.HiBlackString(r.Description))
-		}
-
-		// GUID for reference
-		fmt.Printf("    %s\n", color.HiBlackString("ID: %s", r.GUID[:8]))
-	}
-	fmt.Println()
-
+	renderReminders(os.Stdout, reminders, c.Flat)
 	return nil
+}
+
+type reminderTreeNode struct {
+	reminder reminders.ParsedReminder
+	children []*reminderTreeNode
+}
+
+func renderReminders(writer io.Writer, items []reminders.ParsedReminder, flat bool) {
+	fmt.Fprintln(writer)
+	if flat {
+		for _, item := range items {
+			renderReminder(writer, item, "", "", true)
+		}
+		fmt.Fprintln(writer)
+		return
+	}
+
+	nodes := make([]*reminderTreeNode, 0, len(items))
+	byRecordName := make(map[string]*reminderTreeNode, len(items))
+	for _, item := range items {
+		node := &reminderTreeNode{reminder: item}
+		nodes = append(nodes, node)
+		byRecordName[item.RecordName] = node
+	}
+	var roots []*reminderTreeNode
+	for _, node := range nodes {
+		parent := byRecordName[node.reminder.ParentRecordName]
+		if parent == nil || parent == node {
+			roots = append(roots, node)
+			continue
+		}
+		parent.children = append(parent.children, node)
+	}
+
+	rendered := make(map[*reminderTreeNode]bool, len(nodes))
+	for _, root := range roots {
+		renderReminderTree(writer, root, "", "", true, rendered)
+	}
+	// Cyclic or malformed parent references must not hide reminders.
+	for _, node := range nodes {
+		if !rendered[node] {
+			renderReminderTree(writer, node, "", "", true, rendered)
+		}
+	}
+	fmt.Fprintln(writer)
+}
+
+func renderReminderTree(writer io.Writer, node *reminderTreeNode, prefix, connector string, last bool, rendered map[*reminderTreeNode]bool) {
+	if rendered[node] {
+		return
+	}
+	rendered[node] = true
+	renderReminder(writer, node.reminder, prefix, connector, last)
+	childPrefix := prefix
+	if connector != "" {
+		if last {
+			childPrefix += "   "
+		} else {
+			childPrefix += "│  "
+		}
+	}
+	for index, child := range node.children {
+		isLast := index == len(node.children)-1
+		branch := "├─"
+		if isLast {
+			branch = "└─"
+		}
+		renderReminderTree(writer, child, childPrefix, branch, isLast, rendered)
+	}
+}
+
+func renderReminder(writer io.Writer, r reminders.ParsedReminder, prefix, connector string, last bool) {
+	bullet := "○"
+	titleColor := color.New(color.FgWhite)
+	if r.Completed {
+		bullet = "✓"
+		titleColor = color.New(color.FgHiBlack, color.CrossedOut)
+	}
+
+	// Priority indicator
+	priority := ""
+	switch r.Priority {
+	case 1:
+		priority = color.RedString(" !!!")
+	case 5:
+		priority = color.YellowString(" !!")
+	case 9:
+		priority = color.BlueString(" !")
+	}
+
+	linePrefix := "  " + prefix
+	if connector != "" {
+		linePrefix += connector + " "
+	}
+	fmt.Fprintf(writer, "%s%s %s%s\n", linePrefix, bullet, titleColor.Sprint(r.Title), priority)
+	detailPrefix := "    "
+	if connector != "" {
+		detailPrefix = "  " + prefix
+		if last {
+			detailPrefix += "   "
+		} else {
+			detailPrefix += "│  "
+		}
+		detailPrefix += "  "
+	}
+
+	// Due date
+	if r.DueDate != nil {
+		dueStr := formatDueDate(*r.DueDate)
+		if r.DueDate.Before(time.Now()) && !r.Completed {
+			fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.RedString("⏰ %s (overdue)", dueStr))
+		} else {
+			fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.HiBlackString("⏰ %s", dueStr))
+		}
+	}
+
+	// Description
+	if r.Description != "" {
+		fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.HiBlackString(r.Description))
+	}
+
+	// GUID for reference
+	fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.HiBlackString("ID: %s", shortReminderID(r.GUID)))
+}
+
+func shortReminderID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }
 
 func formatDueDate(t time.Time) string {

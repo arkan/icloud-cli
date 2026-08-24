@@ -1,6 +1,69 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"strings"
+	"testing"
+
+	"github.com/arkan/icloud-cli/internal/reminders"
+	"github.com/fatih/color"
+)
+
+func TestRenderRemindersShowsSubtasksAsTree(t *testing.T) {
+	previousNoColor := color.NoColor
+	color.NoColor = true
+	t.Cleanup(func() { color.NoColor = previousNoColor })
+
+	items := []reminders.ParsedReminder{
+		{GUID: "PARENT01-full", RecordName: "Reminder/PARENT01-full", Title: "Parent"},
+		{GUID: "CHILD001-full", RecordName: "Reminder/CHILD001-full", ParentRecordName: "Reminder/PARENT01-full", Title: "First child"},
+		{GUID: "GRAND001-full", RecordName: "Reminder/GRAND001-full", ParentRecordName: "Reminder/CHILD001-full", Title: "Grandchild"},
+		{GUID: "CHILD002-full", RecordName: "Reminder/CHILD002-full", ParentRecordName: "Reminder/PARENT01-full", Title: "Last child"},
+		{GUID: "ORPHAN01-full", RecordName: "Reminder/ORPHAN01-full", ParentRecordName: "Reminder/MISSING", Title: "Orphan"},
+	}
+
+	var output bytes.Buffer
+	renderReminders(&output, items, false)
+	lines := reminderTitleLines(output.String())
+	want := []string{
+		"  ○ Parent",
+		"  ├─ ○ First child",
+		"  │  └─ ○ Grandchild",
+		"  └─ ○ Last child",
+		"  ○ Orphan",
+	}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("tree title lines:\n%s\nwant:\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestRenderRemindersFlatPreservesInputOrderWithoutBranches(t *testing.T) {
+	previousNoColor := color.NoColor
+	color.NoColor = true
+	t.Cleanup(func() { color.NoColor = previousNoColor })
+
+	items := []reminders.ParsedReminder{
+		{GUID: "CHILD001", RecordName: "Reminder/CHILD001", ParentRecordName: "Reminder/PARENT01", Title: "Child"},
+		{GUID: "PARENT01", RecordName: "Reminder/PARENT01", Title: "Parent"},
+	}
+	var output bytes.Buffer
+	renderReminders(&output, items, true)
+	lines := reminderTitleLines(output.String())
+	want := []string{"  ○ Child", "  ○ Parent"}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("flat title lines:\n%s\nwant:\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func reminderTitleLines(output string) []string {
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "○") || strings.Contains(line, "✓") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
 
 func TestParseEarlyReminder(t *testing.T) {
 	t.Parallel()

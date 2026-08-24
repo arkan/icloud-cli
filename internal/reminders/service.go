@@ -35,15 +35,16 @@ type Sharee struct {
 
 // ParsedReminder is a user-friendly reminder representation
 type ParsedReminder struct {
-	GUID        string
-	RecordName  string
-	ListGUID    string
-	ListName    string
-	Title       string
-	Description string
-	DueDate     *time.Time
-	Completed   bool
-	Priority    int
+	GUID             string
+	RecordName       string
+	ParentRecordName string
+	ListGUID         string
+	ListName         string
+	Title            string
+	Description      string
+	DueDate          *time.Time
+	Completed        bool
+	Priority         int
 }
 
 // NewService creates a new Reminders service using CloudKit
@@ -101,14 +102,15 @@ func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]Par
 		}
 
 		parsed := ParsedReminder{
-			GUID:        guid,
-			RecordName:  item.ID,
-			ListGUID:    item.ListID,
-			Title:       item.Title,
-			Description: item.Notes,
-			Completed:   item.Completed,
-			Priority:    item.Priority,
-			DueDate:     item.DueDate,
+			GUID:             guid,
+			RecordName:       item.ID,
+			ParentRecordName: item.ParentID,
+			ListGUID:         item.ListID,
+			Title:            item.Title,
+			Description:      item.Notes,
+			Completed:        item.Completed,
+			Priority:         item.Priority,
+			DueDate:          item.DueDate,
 		}
 		result = append(result, parsed)
 	}

@@ -13,7 +13,7 @@ CloudKit web service used by iCloud.com.
 
 - Apple ID authentication with 2FA support
 - Persistent authenticated sessions
-- List and search reminders and lists
+- List and search reminders and lists, with subtasks rendered as a tree
 - Add reminders with notes, due dates, and priorities
 - Create subtasks, manage native tags, set or clear flags, assign shared reminders, and manage location alarms
 - Set or clear due dates and native daily, weekly, monthly, or yearly recurrence
@@ -49,6 +49,7 @@ icloud status
 icloud reminders lists
 icloud reminders ls
 icloud reminders ls "Shopping"
+icloud reminders ls --flat "Shopping"
 
 # Create and mutate reminders
 icloud reminders add "Buy milk" -l "Shopping"
@@ -82,7 +83,8 @@ icloud reminders rm ABC12345
 ```
 
 Reminder commands accept a full CloudKit record name or a unique prefix shown
-by `icloud reminders ls`.
+by `icloud reminders ls`. Subtasks are displayed below their parent by default;
+use `--flat` to preserve the server order without hierarchy.
 
 ## How writes work
 
