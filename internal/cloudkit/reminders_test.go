@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/arkan/icloud-cli/internal/api"
 	"github.com/arkan/icloud-cli/internal/config"
@@ -733,6 +734,289 @@ func TestCreateLocationAlarmUsesAtomicAlarmAndTriggerContract(t *testing.T) {
 	reference, _ := trigger.Record.Fields["Alarm"].Value.(map[string]interface{})
 	if reference["recordName"] != alarm.Record.RecordName || reference["action"] != "VALIDATE" {
 		t.Errorf("alarm reference = %#v", reference)
+	}
+}
+
+func TestSetTimedDueDateCreatesNativeDateAlarm(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AlarmIDs":{"value":[],"type":"EMPTY_LIST"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	due := time.Date(2026, 8, 26, 14, 30, 0, 0, time.FixedZone("Europe/Paris", 2*60*60))
+	if err := service.UpdateDueDate("Reminder/R1", &DueDateChange{Date: due}); err != nil {
+		t.Fatalf("UpdateDueDate: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 3 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	parent := modify.Operations[0].Record
+	if parent.Fields["DueDate"].Value != float64(1787747400000) || parent.Fields["AllDay"].Value != float64(0) {
+		t.Errorf("due fields = %#v", parent.Fields)
+	}
+	ids := fieldStringList(parent.Fields["AlarmIDs"].Value)
+	if len(ids) != 1 || modify.Operations[1].Record.RecordName != "Alarm/"+ids[0] {
+		t.Fatalf("alarm operations = %#v", modify.Operations)
+	}
+	trigger := modify.Operations[2].Record
+	if trigger.Fields["Type"].Value != "Date" || trigger.Parent == nil || trigger.Parent.RecordName != "Alarm/"+ids[0] {
+		t.Errorf("trigger = %#v", trigger)
+	}
+	encoded, _ := trigger.Fields["DateComponentsData"].Value.(string)
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var components map[string]interface{}
+	if err := json.Unmarshal(decoded, &components); err != nil {
+		t.Fatal(err)
+	}
+	if components["hour"] != float64(14) || components["minute"] != float64(30) {
+		t.Errorf("date components = %#v", components)
+	}
+}
+
+func TestClearDueDateDeletesOnlyDateAlarm(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			switch lookupCount {
+			case 1:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AlarmIDs":{"value":["DATE","LOCATION"],"type":"STRING_LIST"},"ResolutionTokenMap":{"value":"{\"map\":{\"dueDate\":{\"counter\":1,\"modificationTime\":1,\"replicaID\":\"D\"},\"timeZone\":{\"counter\":1,\"modificationTime\":1,\"replicaID\":\"T\"},\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":1,\"replicaID\":\"L\"}}}"}}}]}`)
+			case 2:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Alarm/DATE","recordType":"Alarm","recordChangeTag":"date-change","fields":{"TriggerID":{"value":"TD"}}},{"recordName":"Alarm/LOCATION","recordType":"Alarm","recordChangeTag":"location-change","fields":{"TriggerID":{"value":"TL"}}}]}`)
+			case 3:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"AlarmTrigger/TD","recordType":"AlarmTrigger","recordChangeTag":"td-change","fields":{"Type":{"value":"Date"}}}]}`)
+			case 4:
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"AlarmTrigger/TL","recordType":"AlarmTrigger","recordChangeTag":"tl-change","fields":{"Type":{"value":"Location"}}}]}`)
+			}
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateDueDate("Reminder/R1", nil); err != nil {
+		t.Fatalf("UpdateDueDate: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 3 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	parent := modify.Operations[0].Record
+	if ids := fieldStringList(parent.Fields["AlarmIDs"].Value); len(ids) != 1 || ids[0] != "LOCATION" {
+		t.Errorf("remaining alarm IDs = %#v", ids)
+	}
+	if parent.Fields["DueDate"].Value != nil || parent.Fields["TimeZone"].Value != nil {
+		t.Errorf("cleared fields = %#v", parent.Fields)
+	}
+	if modify.Operations[1].Record.RecordName != "AlarmTrigger/TD" || modify.Operations[2].Record.RecordName != "Alarm/DATE" {
+		t.Errorf("delete operations = %#v", modify.Operations[1:])
+	}
+}
+
+func TestUpdateRecurrencePreservesExistingNativeRule(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			if lookupCount == 1 {
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"DueDate":{"value":1787904000000,"type":"TIMESTAMP"},"AllDay":{"value":0,"type":"NUMBER_INT64"},"TimeZone":{"value":"Europe/Paris","type":"STRING"},"RecurrenceRuleIDs":{"value":["OLD"],"type":"STRING_LIST"},"ResolutionTokenMap":{"value":"{\"map\":{\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":1,\"replicaID\":\"R\"}}}"}}}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"RecurrenceRule/OLD","recordType":"RecurrenceRule","recordChangeTag":"old-change"}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	end := time.Date(2026, 9, 30, 0, 0, 0, 0, time.FixedZone("Europe/Paris", 2*60*60))
+	if err := service.UpdateRecurrence("Reminder/R1", &RecurrenceRule{Frequency: 1, Interval: 2, EndDate: &end}); err != nil {
+		t.Fatalf("UpdateRecurrence: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	ids := fieldStringList(modify.Operations[0].Record.Fields["RecurrenceRuleIDs"].Value)
+	if len(ids) != 1 {
+		t.Fatalf("recurrence IDs = %#v", ids)
+	}
+	updated := modify.Operations[1]
+	if updated.OperationType != OperationUpdate || updated.Record.RecordName != "RecurrenceRule/OLD" || updated.Record.RecordChangeTag != "old-change" {
+		t.Fatalf("update operation = %#v", updated)
+	}
+	if updated.Record.Fields["Frequency"].Value != float64(1) || updated.Record.Fields["Interval"].Value != float64(2) {
+		t.Errorf("recurrence fields = %#v", updated.Record.Fields)
+	}
+	if updated.Record.Fields["EndDate"].Value != float64(1790755140000) {
+		t.Errorf("end date = %#v", updated.Record.Fields["EndDate"])
+	}
+}
+
+func TestCreateRecurrenceWritesChildBeforeParent(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"DueDate":{"value":1787904000000,"type":"TIMESTAMP"},"ResolutionTokenMap":{"value":"{\"map\":{\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":1,\"replicaID\":\"R\"}}}"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateRecurrence("Reminder/R1", &RecurrenceRule{Frequency: 0, Interval: 1}); err != nil {
+		t.Fatalf("UpdateRecurrence: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	child := modify.Operations[0]
+	parent := modify.Operations[1]
+	if child.OperationType != OperationCreate || child.Record.RecordType != "RecurrenceRule" {
+		t.Fatalf("first operation = %#v", child)
+	}
+	ids := fieldStringList(parent.Record.Fields["RecurrenceRuleIDs"].Value)
+	if parent.OperationType != OperationUpdate || len(ids) != 1 || child.Record.RecordName != "RecurrenceRule/"+ids[0] {
+		t.Fatalf("parent operation = %#v", parent)
+	}
+	if cached := service.records["Reminder/R1"]; cached.RecordName != "Reminder/R1" || len(fieldStringList(cached.Fields["RecurrenceRuleIDs"].Value)) != 1 {
+		t.Fatalf("cached reminder = %#v", cached)
+	}
+}
+
+func TestClearRecurrenceDeletesNativeRule(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			if lookupCount == 1 {
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"RecurrenceRuleIDs":{"value":["RULE"],"type":"STRING_LIST"},"ResolutionTokenMap":{"value":"{\"map\":{\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":1,\"replicaID\":\"R\"}}}"}}}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"RecurrenceRule/RULE","recordType":"RecurrenceRule","recordChangeTag":"rule-change"}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateRecurrence("Reminder/R1", nil); err != nil {
+		t.Fatalf("UpdateRecurrence: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	parent := modify.Operations[0]
+	deleted := modify.Operations[1]
+	if ids := fieldStringList(parent.Record.Fields["RecurrenceRuleIDs"].Value); len(ids) != 0 {
+		t.Errorf("recurrence IDs = %#v", ids)
+	}
+	if deleted.OperationType != OperationDelete || deleted.Record.RecordName != "RecurrenceRule/RULE" || deleted.Record.RecordChangeTag != "rule-change" {
+		t.Fatalf("delete operation = %#v", deleted)
 	}
 }
 

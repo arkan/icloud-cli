@@ -16,6 +16,7 @@ CloudKit web service used by iCloud.com.
 - List and search reminders and lists
 - Add reminders with notes, due dates, and priorities
 - Create subtasks, manage native tags, set or clear flags, assign shared reminders, and manage location alarms
+- Set or clear due dates and native daily, weekly, monthly, or yearly recurrence
 - Edit titles, notes, due dates, and priorities (text updates are experimental)
 - Mark reminders complete (experimental)
 - Delete reminders
@@ -66,6 +67,10 @@ icloud reminders edit ABC12345 --location-title "Office" --address "1 Infinite L
 icloud reminders edit ABC12345 --clear-location
 icloud reminders edit ABC12345 --url "https://example.com"
 icloud reminders edit ABC12345 --clear-url
+icloud reminders edit ABC12345 --repeat daily
+icloud reminders edit ABC12345 --repeat weekly --repeat-interval 2
+icloud reminders edit ABC12345 --repeat monthly --repeat-until 2026-12-31
+icloud reminders edit ABC12345 --clear-repeat
 icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
@@ -126,7 +131,8 @@ and renders correctly. A dedicated test account is recommended.
   CRDT document, but live tests on one account reconciled it back to the
   previous text. The command is exposed for accounts where that private API
   behavior differs. Priority and due-date updates are verified.
-- Clearing an existing due date is not yet exposed by the CLI.
+- Due-date creation, replacement, and removal are verified. Timed due dates use
+  the configured IANA timezone; date-only values remain all-day reminders.
 - Tag creation and removal are verified. Renaming tags is not exposed; remove
   the old tag and add the replacement instead.
 - Shared-list assignment and unassignment are verified for accepted participants.
@@ -136,11 +142,16 @@ and renders correctly. A dedicated test account is recommended.
   control; the CLI accepts an explicit radius in meters.
 - Native URL attachment creation, replacement, and removal are verified in the
   iPhone app. Setting a URL preserves attachments of other types.
+- Daily, weekly, monthly, and yearly recurrence creation, modification, and
+  removal are verified in the native iPhone app. Creation must write the child
+  rule before the parent relation; modification preserves the existing native
+  rule identity; removal uses a native CloudKit delete rather than `Deleted=1`.
 - Image attachments are not supported. They require a multi-stage CloudKit
   asset upload followed by an undocumented `Attachment` record mutation. The
   only verified writer found uses Apple's private ReminderKit on macOS, so no
   cross-platform contract has been validated on an Apple device.
-- Time-based alarm management is not yet exposed.
+- A timed due date creates its native date alarm. Early-reminder offsets are not
+  yet exposed separately.
 - The “When Messaging” trigger is not supported. CloudKit exposes its encrypted
   `ContactHandles` field, but direct writes and removals did not materialize
   reliably in the native iPhone app; the state also depends on local

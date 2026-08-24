@@ -384,6 +384,27 @@ parent update also refreshes `LastModifiedDate` but leaves
 URL in the native iPhone app. Creation, replacement, and removal are verified
 on iPhone.
 
+### Add, update, or remove recurrence
+
+A recurrence is a `RecurrenceRule/<UUID>` child whose UUID is stored without
+the record-type prefix in the reminder's `RecurrenceRuleIDs` string list. The
+child has a CloudKit parent and a validating `Reminder` reference. Its numeric
+fields include `Frequency` (`0` daily, `1` weekly, `2` monthly, `3` yearly),
+`Interval`, `OccurrenceCount`, `FirstDayOfTheWeek`, `Imported`, and `Deleted`.
+
+Creation is order-sensitive even inside an atomic modification. The child must
+be created before the reminder is updated to reference its UUID. Writing the
+parent first produces a structurally valid CloudKit graph that the native iOS
+app does not materialize.
+
+An existing rule is updated in place with its current change tag. Replacing it
+with a new Web-created child leaves iOS displaying the previous device-local
+rule. Clearing recurrence first writes an empty `RecurrenceRuleIDs` list on the
+parent and then uses the native CloudKit `delete` operation for the child. A
+soft deletion using `Deleted = 1` is accepted by the server but does not clear
+the recurrence in the iOS app. These three transitions were verified on a
+native iPhone.
+
 ### Unsupported: When Messaging trigger
 
 The native app stores the selected contact's complete set of email addresses

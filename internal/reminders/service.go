@@ -117,7 +117,7 @@ func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]Par
 }
 
 // Add creates a new reminder via CloudKit
-func (s *Service) Add(title, description, listGUID string, dueDate *time.Time, priority int, parentGUID string) error {
+func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.DueDateChange, priority int, parentGUID string) error {
 	// If no list specified, use the first available list
 	if listGUID == "" && parentGUID == "" {
 		lists, err := s.cloudkitSvc.GetLists()
@@ -130,11 +130,32 @@ func (s *Service) Add(title, description, listGUID string, dueDate *time.Time, p
 		listGUID = lists[0].ID
 	}
 
-	_, err := s.cloudkitSvc.AddReminderWithParent(title, description, listGUID, priority, dueDate, parentGUID)
+	created, err := s.cloudkitSvc.AddReminderWithParent(title, description, listGUID, priority, nil, parentGUID)
 	if err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
+	if dueDate != nil {
+		if err := s.cloudkitSvc.UpdateDueDate(created.ID, dueDate); err != nil {
+			return fmt.Errorf("set reminder due date: %w", err)
+		}
+	}
 
+	return nil
+}
+
+// UpdateDueDate replaces or clears the due date and its native date alarm.
+func (s *Service) UpdateDueDate(reminderGUID string, due *cloudkit.DueDateChange) error {
+	if err := s.cloudkitSvc.UpdateDueDate(reminderGUID, due); err != nil {
+		return fmt.Errorf("update due date: %w", err)
+	}
+	return nil
+}
+
+// UpdateRecurrence replaces or clears the reminder's native recurrence rule.
+func (s *Service) UpdateRecurrence(reminderGUID string, recurrence *cloudkit.RecurrenceRule) error {
+	if err := s.cloudkitSvc.UpdateRecurrence(reminderGUID, recurrence); err != nil {
+		return fmt.Errorf("update recurrence: %w", err)
+	}
 	return nil
 }
 

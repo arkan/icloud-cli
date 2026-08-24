@@ -62,10 +62,15 @@ func TestIntegrationReminderLifecycle(t *testing.T) {
 	editedDue := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
 	if err := retryMutation(func() error {
 		return service.UpdateReminder(created.ID, ReminderChanges{
-			Priority: &editedPriority, DueDate: &editedDue,
+			Priority: &editedPriority,
 		})
 	}); err != nil {
 		t.Fatalf("edit reminder: %v", err)
+	}
+	if err := retryMutation(func() error {
+		return service.UpdateDueDate(created.ID, &DueDateChange{Date: editedDue})
+	}); err != nil {
+		t.Fatalf("edit reminder due date: %v", err)
 	}
 	if err := service.Sync(true); err != nil {
 		t.Fatalf("resync after edit: %v", err)

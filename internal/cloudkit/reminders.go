@@ -71,8 +71,21 @@ type ReminderChanges struct {
 	Title    *string
 	Notes    *string
 	Priority *int
-	DueDate  *time.Time
 	Flagged  *bool
+}
+
+// DueDateChange describes a native due date. A nil change clears the due date.
+type DueDateChange struct {
+	Date     time.Time
+	AllDay   bool
+	TimeZone string
+}
+
+// RecurrenceRule describes the simple recurrence forms exposed by the CLI.
+type RecurrenceRule struct {
+	Frequency int
+	Interval  int
+	EndDate   *time.Time
 }
 
 // LocationAlarm describes a geofence trigger for a reminder.
@@ -853,9 +866,6 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 	if changes.Priority != nil {
 		fields["Priority"] = FieldValue{Value: *changes.Priority}
 	}
-	if changes.DueDate != nil {
-		fields["DueDate"] = FieldValue{Value: changes.DueDate.UnixMilli()}
-	}
 	if changes.Flagged != nil {
 		value := int64(0)
 		if *changes.Flagged {
@@ -898,26 +908,37 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 }
 
 func addResolutionTokenUpdate(record Record, fields map[string]FieldValue, key string) error {
-	tokenField, ok := record.Fields["ResolutionTokenMap"]
-	if !ok {
-		return fmt.Errorf("record has no ResolutionTokenMap")
-	}
-	encoded, ok := tokenField.Value.(string)
-	if !ok || encoded == "" {
-		return fmt.Errorf("record has an invalid ResolutionTokenMap")
-	}
+	return addResolutionTokenUpdates(record, fields, key)
+}
+
+func addResolutionTokenUpdates(record Record, fields map[string]FieldValue, keys ...string) error {
 	var envelope struct {
 		Map map[string]map[string]interface{} `json:"map"`
 	}
-	if err := json.Unmarshal([]byte(encoded), &envelope); err != nil {
-		return err
+	tokenField, exists := record.Fields["ResolutionTokenMap"]
+	if exists {
+		encoded, ok := tokenField.Value.(string)
+		if !ok || encoded == "" {
+			return fmt.Errorf("record has an invalid ResolutionTokenMap")
+		}
+		if err := json.Unmarshal([]byte(encoded), &envelope); err != nil {
+			return err
+		}
+	}
+	if envelope.Map == nil {
+		envelope.Map = make(map[string]map[string]interface{})
 	}
 	now := time.Now()
 	coreDataTime := float64(now.UnixMilli())/1000 - 978307200
-	for _, tokenKey := range []string{key, "lastModifiedDate"} {
+	keys = append(keys, "lastModifiedDate")
+	for _, tokenKey := range keys {
 		token, ok := envelope.Map[tokenKey]
 		if !ok {
-			return fmt.Errorf("resolution token %q is missing", tokenKey)
+			envelope.Map[tokenKey] = map[string]interface{}{
+				"counter": float64(1), "modificationTime": coreDataTime,
+				"replicaID": strings.ToUpper(uuid.New().String()),
+			}
+			continue
 		}
 		counter, ok := token["counter"].(float64)
 		if !ok {
@@ -1321,6 +1342,162 @@ func (s *RemindersService) locationAlarmDeletes(alarmIDs []string) ([]string, []
 	return remaining, deletes, nil
 }
 
+// UpdateDueDate replaces or clears a due date and its native Date alarm while
+// preserving location and other alarm types.
+func (s *RemindersService) UpdateDueDate(reminderID string, due *DueDateChange) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+	remainingAlarmIDs, childOperations, err := s.dateAlarmDeletes(fieldStringList(existing.Fields["AlarmIDs"].Value))
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+	fields := map[string]FieldValue{
+		"LastModifiedDate": {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+	}
+	tokenKeys := []string{"dueDate"}
+	if due == nil {
+		fields["DueDate"] = FieldValue{Value: nil, Type: "TIMESTAMP"}
+		fields["TimeZone"] = FieldValue{Value: nil, Type: "STRING"}
+		tokenKeys = append(tokenKeys, "timeZone")
+	} else {
+		date := due.Date
+		timestamp := date.UnixMilli()
+		if due.AllDay {
+			timestamp = wallClockTimestamp(date)
+		}
+		fields["DueDate"] = FieldValue{Value: timestamp, Type: "TIMESTAMP"}
+		allDay := int64(0)
+		if due.AllDay {
+			allDay = 1
+			fields["TimeZone"] = FieldValue{Value: nil, Type: "STRING"}
+		} else {
+			zone := due.TimeZone
+			if zone == "" {
+				zone = date.Location().String()
+			}
+			fields["TimeZone"] = FieldValue{Value: zone, Type: "STRING"}
+			alarmID := strings.ToUpper(uuid.New().String())
+			triggerID := strings.ToUpper(uuid.New().String())
+			remainingAlarmIDs = append(remainingAlarmIDs, alarmID)
+			alarmName := "Alarm/" + alarmID
+			components, err := json.Marshal(map[string]interface{}{
+				"era": 1, "year": date.Year(), "month": int(date.Month()), "day": date.Day(),
+				"hour": date.Hour(), "minute": date.Minute(), "second": date.Second(),
+				"timeZone": map[string]string{"identifier": zone},
+			})
+			if err != nil {
+				return fmt.Errorf("encode date alarm components: %w", err)
+			}
+			childOperations = append(childOperations,
+				RecordOperation{OperationType: OperationCreate, Record: Record{
+					RecordName: alarmName, RecordType: "Alarm", Parent: &RecordReference{RecordName: reminderID},
+					Fields: map[string]FieldValue{
+						"AlarmUID": {Value: alarmID, Type: "STRING"}, "Deleted": {Value: int64(0), Type: "NUMBER_INT64"},
+						"Imported":                      {Value: int64(0), Type: "NUMBER_INT64"},
+						"Reminder":                      {Value: RecordReference{RecordName: reminderID, Action: "VALIDATE"}, Type: "REFERENCE"},
+						"TriggerID":                     {Value: triggerID, Type: "STRING"},
+						"DueDateResolutionTokenAsNonce": {Value: float64(100000000000) + float64(now.UnixMilli())/1000 - 978307200, Type: "NUMBER_DOUBLE"},
+					},
+				}},
+				RecordOperation{OperationType: OperationCreate, Record: Record{
+					RecordName: "AlarmTrigger/" + triggerID, RecordType: "AlarmTrigger", Parent: &RecordReference{RecordName: alarmName},
+					Fields: map[string]FieldValue{
+						"Alarm":              {Value: RecordReference{RecordName: alarmName, Action: "VALIDATE"}, Type: "REFERENCE"},
+						"DateComponentsData": {Value: base64.StdEncoding.EncodeToString(components), Type: "BYTES"},
+						"Deleted":            {Value: int64(0), Type: "NUMBER_INT64"}, "Imported": {Value: int64(0), Type: "NUMBER_INT64"},
+						"Type": {Value: "Date", Type: "STRING"},
+					},
+				}},
+			)
+		}
+		fields["AllDay"] = FieldValue{Value: allDay, Type: "NUMBER_INT64"}
+		tokenKeys = append(tokenKeys, "allDay", "timeZone")
+	}
+	fields["AlarmIDs"] = FieldValue{Value: remainingAlarmIDs, Type: "STRING_LIST"}
+	if err := addResolutionTokenUpdates(existing, fields, tokenKeys...); err != nil {
+		return fmt.Errorf("update due date resolution tokens: %w", err)
+	}
+
+	parent := RecordOperation{OperationType: OperationUpdate, Record: Record{
+		RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag, Fields: fields,
+	}}
+	operations := append([]RecordOperation{parent}, childOperations...)
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID, Operations: operations, Atomic: true,
+	})
+	if err != nil {
+		return fmt.Errorf("update due date: %w", err)
+	}
+	if len(response.Records) != len(operations) {
+		return fmt.Errorf("update due date: got %d records, want %d", len(response.Records), len(operations))
+	}
+	for _, record := range response.Records {
+		if err := recordError(record); err != nil {
+			return fmt.Errorf("update due date: %w", err)
+		}
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
+}
+
+func wallClockTimestamp(date time.Time) int64 {
+	return time.Date(date.Year(), date.Month(), date.Day(), date.Hour(), date.Minute(), date.Second(), date.Nanosecond(), time.UTC).UnixMilli()
+}
+
+func (s *RemindersService) dateAlarmDeletes(alarmIDs []string) ([]string, []RecordOperation, error) {
+	if len(alarmIDs) == 0 {
+		return nil, nil, nil
+	}
+	alarmNames := make([]string, 0, len(alarmIDs))
+	for _, id := range alarmIDs {
+		alarmNames = append(alarmNames, "Alarm/"+id)
+	}
+	response, err := s.client.LookupRecords(RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, alarmNames)
+	if err != nil {
+		return nil, nil, fmt.Errorf("lookup reminder alarms: %w", err)
+	}
+	remaining := make([]string, 0, len(alarmIDs))
+	deletes := make([]RecordOperation, 0)
+	for _, alarm := range response.Records {
+		if err := recordError(alarm); err != nil {
+			return nil, nil, fmt.Errorf("lookup reminder alarm: %w", err)
+		}
+		triggerID, _ := alarm.Fields["TriggerID"].Value.(string)
+		if triggerID == "" {
+			remaining = append(remaining, strings.TrimPrefix(alarm.RecordName, "Alarm/"))
+			continue
+		}
+		triggers, err := s.client.LookupRecords(RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, []string{"AlarmTrigger/" + triggerID})
+		if err != nil {
+			return nil, nil, fmt.Errorf("lookup alarm trigger %s: %w", triggerID, err)
+		}
+		if len(triggers.Records) == 0 {
+			return nil, nil, fmt.Errorf("lookup alarm trigger %s: no record returned", triggerID)
+		}
+		trigger := triggers.Records[0]
+		if err := recordError(trigger); err != nil {
+			return nil, nil, fmt.Errorf("lookup alarm trigger: %w", err)
+		}
+		if trigger.Fields["Type"].Value != "Date" {
+			remaining = append(remaining, strings.TrimPrefix(alarm.RecordName, "Alarm/"))
+			continue
+		}
+		deletes = append(deletes,
+			RecordOperation{OperationType: OperationDelete, Record: Record{RecordName: trigger.RecordName, RecordType: "AlarmTrigger", RecordChangeTag: trigger.RecordChangeTag}},
+			RecordOperation{OperationType: OperationDelete, Record: Record{RecordName: alarm.RecordName, RecordType: "Alarm", RecordChangeTag: alarm.RecordChangeTag}},
+		)
+	}
+	return remaining, deletes, nil
+}
+
 // UpdateURLAttachment replaces or clears URL attachments while preserving
 // image and other attachment types linked to the reminder.
 func (s *RemindersService) UpdateURLAttachment(reminderID, rawURL string) error {
@@ -1414,6 +1591,194 @@ func (s *RemindersService) UpdateURLAttachment(reminderID, rawURL string) error 
 	s.records[reminderID] = mergeRecord(existing, response.Records[0])
 	s.persistCache()
 	return nil
+}
+
+// UpdateRecurrence replaces or clears the reminder's simple recurrence rule.
+func (s *RemindersService) UpdateRecurrence(reminderID string, recurrence *RecurrenceRule) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	if recurrence != nil {
+		if recurrence.Frequency < 0 || recurrence.Frequency > 3 {
+			return fmt.Errorf("recurrence frequency must be daily, weekly, monthly, or yearly")
+		}
+		if recurrence.Interval < 1 || recurrence.Interval > 999 {
+			return fmt.Errorf("recurrence interval must be between 1 and 999")
+		}
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+	currentIDs := fieldStringList(existing.Fields["RecurrenceRuleIDs"].Value)
+	operations := make([]RecordOperation, 0, len(currentIDs)+2)
+	currentRules := make([]Record, 0, len(currentIDs))
+	if len(currentIDs) > 0 {
+		names := make([]string, 0, len(currentIDs))
+		for _, id := range currentIDs {
+			names = append(names, "RecurrenceRule/"+id)
+		}
+		response, err := s.client.LookupRecords(RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, names)
+		if err != nil {
+			return fmt.Errorf("lookup recurrence rules: %w", err)
+		}
+		if len(response.Records) != len(names) {
+			return fmt.Errorf("lookup recurrence rules: got %d records, want %d", len(response.Records), len(names))
+		}
+		for _, record := range response.Records {
+			if err := recordError(record); err != nil {
+				return fmt.Errorf("lookup recurrence rule: %w", err)
+			}
+			currentRules = append(currentRules, record)
+		}
+	}
+
+	updateExisting := recurrence != nil && len(currentRules) == 1
+	if updateExisting {
+		rule := currentRules[0]
+		fields := map[string]FieldValue{
+			"Deleted":           {Value: int64(0), Type: "NUMBER_INT64"},
+			"FirstDayOfTheWeek": {Value: int64(0), Type: "NUMBER_INT64"},
+			"Frequency":         {Value: int64(recurrence.Frequency), Type: "NUMBER_INT64"},
+			"Imported":          {Value: int64(0), Type: "NUMBER_INT64"},
+			"Interval":          {Value: int64(recurrence.Interval), Type: "NUMBER_INT64"},
+			"OccurrenceCount":   {Value: int64(0), Type: "NUMBER_INT64"},
+		}
+		if recurrence.EndDate != nil {
+			endDate, err := recurrenceEndDate(existing, *recurrence.EndDate)
+			if err != nil {
+				return err
+			}
+			fields["EndDate"] = FieldValue{Value: endDate.UnixMilli(), Type: "TIMESTAMP"}
+		} else if _, exists := rule.Fields["EndDate"]; exists {
+			fields["EndDate"] = FieldValue{Value: nil, Type: "TIMESTAMP"}
+		}
+		operations = append(operations, RecordOperation{OperationType: OperationUpdate, Record: Record{
+			RecordName: rule.RecordName, RecordType: "RecurrenceRule", RecordChangeTag: rule.RecordChangeTag,
+			Fields: fields,
+		}})
+	} else {
+		for _, record := range currentRules {
+			if recurrence == nil {
+				operations = append(operations, RecordOperation{OperationType: OperationDelete, Record: Record{
+					RecordName: record.RecordName, RecordType: "RecurrenceRule", RecordChangeTag: record.RecordChangeTag,
+				}})
+				continue
+			}
+			operations = append(operations, RecordOperation{OperationType: OperationUpdate, Record: Record{
+				RecordName: record.RecordName, RecordType: "RecurrenceRule", RecordChangeTag: record.RecordChangeTag,
+				Fields: map[string]FieldValue{"Deleted": {Value: int64(1), Type: "NUMBER_INT64"}},
+			}})
+		}
+	}
+	if recurrence == nil && len(operations) == 0 {
+		return nil
+	}
+
+	ids := make([]string, 0, 1)
+	if updateExisting {
+		ids = append(ids, currentIDs...)
+	}
+	if recurrence != nil && !updateExisting {
+		if _, ok := existing.Fields["DueDate"]; !ok {
+			return fmt.Errorf("recurring reminders require a due date")
+		}
+		id := strings.ToUpper(uuid.New().String())
+		ids = append(ids, id)
+		fields := map[string]FieldValue{
+			"Deleted":           {Value: int64(0), Type: "NUMBER_INT64"},
+			"FirstDayOfTheWeek": {Value: int64(0), Type: "NUMBER_INT64"},
+			"Frequency":         {Value: int64(recurrence.Frequency), Type: "NUMBER_INT64"},
+			"Imported":          {Value: int64(0), Type: "NUMBER_INT64"},
+			"Interval":          {Value: int64(recurrence.Interval), Type: "NUMBER_INT64"},
+			"OccurrenceCount":   {Value: int64(0), Type: "NUMBER_INT64"},
+			"Reminder":          {Value: RecordReference{RecordName: reminderID, Action: "VALIDATE"}, Type: "REFERENCE"},
+		}
+		if recurrence.EndDate != nil {
+			endDate, err := recurrenceEndDate(existing, *recurrence.EndDate)
+			if err != nil {
+				return err
+			}
+			fields["EndDate"] = FieldValue{Value: endDate.UnixMilli(), Type: "TIMESTAMP"}
+		}
+		operations = append(operations, RecordOperation{OperationType: OperationCreate, Record: Record{
+			RecordName: "RecurrenceRule/" + id, RecordType: "RecurrenceRule",
+			Parent: &RecordReference{RecordName: reminderID}, Fields: fields,
+		}})
+	}
+
+	now := time.Now()
+	parentFields := map[string]FieldValue{
+		"RecurrenceRuleIDs": {Value: ids, Type: "STRING_LIST"},
+		"LastModifiedDate":  {Value: now.UnixMilli(), Type: "TIMESTAMP"},
+	}
+	if err := addResolutionTokenUpdates(existing, parentFields); err != nil {
+		return fmt.Errorf("update recurrence resolution token: %w", err)
+	}
+	parent := RecordOperation{OperationType: OperationUpdate, Record: Record{
+		RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag, Fields: parentFields,
+	}}
+	if recurrence != nil && !updateExisting {
+		operations = append(operations, parent)
+	} else {
+		operations = append([]RecordOperation{parent}, operations...)
+	}
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID, Operations: operations, Atomic: true,
+	})
+	if err != nil {
+		return fmt.Errorf("update recurrence: %w", err)
+	}
+	if len(response.Records) != len(operations) {
+		return fmt.Errorf("update recurrence: got %d records, want %d", len(response.Records), len(operations))
+	}
+	for _, record := range response.Records {
+		if err := recordError(record); err != nil {
+			return fmt.Errorf("update recurrence: %w", err)
+		}
+	}
+	for _, record := range response.Records {
+		if record.RecordName == reminderID {
+			s.records[reminderID] = mergeRecord(existing, record)
+			break
+		}
+	}
+	s.persistCache()
+	return nil
+}
+
+func recurrenceEndDate(reminder Record, selected time.Time) (time.Time, error) {
+	dueMillis, ok := numericInt64(reminder.Fields["DueDate"].Value)
+	if !ok {
+		return time.Time{}, fmt.Errorf("recurring reminders require a valid due date")
+	}
+	zoneName, _ := reminder.Fields["TimeZone"].Value.(string)
+	location := time.UTC
+	if zoneName != "" {
+		loaded, err := time.LoadLocation(zoneName)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("load reminder timezone %q: %w", zoneName, err)
+		}
+		location = loaded
+	}
+	due := time.UnixMilli(dueMillis).In(location)
+	if fieldBool(reminder.Fields["AllDay"].Value) {
+		return time.Date(selected.Year(), selected.Month(), selected.Day()+1, 0, 0, 0, 0, location).Add(-time.Minute), nil
+	}
+	return time.Date(selected.Year(), selected.Month(), selected.Day(), due.Hour(), due.Minute(), due.Second(), 0, location).Add(-time.Minute), nil
+}
+
+func numericInt64(value interface{}) (int64, bool) {
+	switch number := value.(type) {
+	case int64:
+		return number, true
+	case int:
+		return int64(number), true
+	case float64:
+		return int64(number), true
+	default:
+		return 0, false
+	}
 }
 
 // UpdateTags atomically updates HashtagIDs and its linked Hashtag records.

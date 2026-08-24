@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -172,26 +173,32 @@ type RemindersCmd struct {
 
 // EditCmd updates selected reminder fields.
 type EditCmd struct {
-	ID            string   `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
-	Title         string   `help:"Replacement title (experimental)"`
-	Description   string   `short:"d" help:"Replacement description (experimental)"`
-	Due           string   `help:"Replacement due date"`
-	Priority      string   `short:"p" help:"Priority: high, medium, low, none"`
-	Flagged       bool     `help:"Set the flag"`
-	NoFlagged     bool     `name:"no-flagged" help:"Clear the flag"`
-	Tags          []string `name:"tag" help:"Add a native tag (repeatable)"`
-	RemoveTags    []string `name:"remove-tag" help:"Remove a native tag (repeatable)"`
-	Assign        string   `help:"Assign to a shared-list participant by name, email, or ID"`
-	Unassign      bool     `help:"Clear the current assignment"`
-	LocationTitle string   `help:"Location alarm title"`
-	Address       string   `help:"Optional location alarm address"`
-	Latitude      *float64 `help:"Location alarm latitude"`
-	Longitude     *float64 `help:"Location alarm longitude"`
-	Radius        float64  `default:"100" help:"Location alarm radius in meters"`
-	Proximity     string   `default:"arriving" help:"Location alarm proximity: arriving or leaving"`
-	ClearLocation bool     `help:"Remove the location alarm"`
-	URL           string   `help:"Set or replace the native URL attachment"`
-	ClearURL      bool     `help:"Remove the native URL attachment"`
+	ID             string   `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
+	Title          string   `help:"Replacement title (experimental)"`
+	Description    string   `short:"d" help:"Replacement description (experimental)"`
+	Due            string   `help:"Replacement due date"`
+	ClearDue       bool     `help:"Remove the due date and its date alarm"`
+	TimeZone       string   `name:"timezone" help:"IANA timezone for due dates (persisted)"`
+	Priority       string   `short:"p" help:"Priority: high, medium, low, none"`
+	Flagged        bool     `help:"Set the flag"`
+	NoFlagged      bool     `name:"no-flagged" help:"Clear the flag"`
+	Tags           []string `name:"tag" help:"Add a native tag (repeatable)"`
+	RemoveTags     []string `name:"remove-tag" help:"Remove a native tag (repeatable)"`
+	Assign         string   `help:"Assign to a shared-list participant by name, email, or ID"`
+	Unassign       bool     `help:"Clear the current assignment"`
+	LocationTitle  string   `help:"Location alarm title"`
+	Address        string   `help:"Optional location alarm address"`
+	Latitude       *float64 `help:"Location alarm latitude"`
+	Longitude      *float64 `help:"Location alarm longitude"`
+	Radius         float64  `default:"100" help:"Location alarm radius in meters"`
+	Proximity      string   `default:"arriving" help:"Location alarm proximity: arriving or leaving"`
+	ClearLocation  bool     `help:"Remove the location alarm"`
+	URL            string   `help:"Set or replace the native URL attachment"`
+	ClearURL       bool     `help:"Remove the native URL attachment"`
+	Repeat         string   `help:"Repeat: daily, weekly, monthly, or yearly"`
+	RepeatInterval int      `default:"1" help:"Recurrence interval"`
+	RepeatUntil    string   `help:"Last recurrence date (YYYY-MM-DD)"`
+	ClearRepeat    bool     `help:"Remove recurrence"`
 }
 
 func (c *EditCmd) Run() error {
@@ -211,13 +218,20 @@ func (c *EditCmd) Run() error {
 	if c.Description != "" {
 		description = &c.Description
 	}
-	var dueDate *time.Time
+	var dueDate *cloudkit.DueDateChange
 	if c.Due != "" {
-		parsed, err := parseDueDate(c.Due)
+		location, zone, err := configuredTimeZone(c.TimeZone)
+		if err != nil {
+			return err
+		}
+		parsed, allDay, err := parseDueDate(c.Due, location)
 		if err != nil {
 			return fmt.Errorf("invalid due date: %w", err)
 		}
-		dueDate = &parsed
+		dueDate = &cloudkit.DueDateChange{Date: parsed, AllDay: allDay, TimeZone: zone}
+	}
+	if dueDate != nil && c.ClearDue {
+		return fmt.Errorf("--due and --clear-due are mutually exclusive")
 	}
 	var priority *int
 	if c.Priority != "" {
@@ -239,6 +253,34 @@ func (c *EditCmd) Run() error {
 	}
 	if c.URL != "" && c.ClearURL {
 		return fmt.Errorf("--url and --clear-url are mutually exclusive")
+	}
+	if c.Repeat != "" && c.ClearRepeat {
+		return fmt.Errorf("--repeat and --clear-repeat are mutually exclusive")
+	}
+	if c.Repeat == "" && c.RepeatUntil != "" {
+		return fmt.Errorf("--repeat-until requires --repeat")
+	}
+	var recurrence *cloudkit.RecurrenceRule
+	if c.Repeat != "" {
+		frequency, err := parseRecurrenceFrequency(c.Repeat)
+		if err != nil {
+			return err
+		}
+		if c.RepeatInterval < 1 || c.RepeatInterval > 999 {
+			return fmt.Errorf("--repeat-interval must be between 1 and 999")
+		}
+		recurrence = &cloudkit.RecurrenceRule{Frequency: frequency, Interval: c.RepeatInterval}
+		if c.RepeatUntil != "" {
+			location, _, err := configuredTimeZone(c.TimeZone)
+			if err != nil {
+				return err
+			}
+			end, err := time.ParseInLocation("2006-01-02", c.RepeatUntil, location)
+			if err != nil {
+				return fmt.Errorf("invalid recurrence end date: %w", err)
+			}
+			recurrence.EndDate = &end
+		}
 	}
 	var location *cloudkit.LocationAlarm
 	if locationRequested {
@@ -263,15 +305,20 @@ func (c *EditCmd) Run() error {
 		value := c.Flagged
 		flagged = &value
 	}
-	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL {
+	if title == nil && description == nil && dueDate == nil && !c.ClearDue && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL && recurrence == nil && !c.ClearRepeat {
 		return fmt.Errorf("no changes specified; use title, due-date, priority, flag, tag, assignment, location, or URL options")
 	}
-	if title != nil || description != nil || dueDate != nil || priority != nil || flagged != nil {
+	if title != nil || description != nil || priority != nil || flagged != nil {
 		changes := cloudkit.ReminderChanges{
-			Title: title, Notes: description, DueDate: dueDate, Priority: priority, Flagged: flagged,
+			Title: title, Notes: description, Priority: priority, Flagged: flagged,
 		}
 		if err := svc.Update(guid, changes); err != nil {
 			return fmt.Errorf("edit reminder: %w", err)
+		}
+	}
+	if dueDate != nil || c.ClearDue {
+		if err := svc.UpdateDueDate(guid, dueDate); err != nil {
+			return fmt.Errorf("edit reminder due date: %w", err)
 		}
 	}
 	if len(c.Tags) > 0 || len(c.RemoveTags) > 0 {
@@ -294,6 +341,11 @@ func (c *EditCmd) Run() error {
 			return fmt.Errorf("edit reminder URL: %w", err)
 		}
 	}
+	if recurrence != nil || c.ClearRepeat {
+		if err := svc.UpdateRecurrence(guid, recurrence); err != nil {
+			return fmt.Errorf("edit reminder recurrence: %w", err)
+		}
+	}
 	color.Green("✓ Update submitted")
 	return nil
 }
@@ -306,6 +358,21 @@ func parseProximity(value string) (int, error) {
 		return 2, nil
 	default:
 		return 0, fmt.Errorf("invalid proximity %q; use arriving or leaving", value)
+	}
+}
+
+func parseRecurrenceFrequency(value string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "daily":
+		return 0, nil
+	case "weekly":
+		return 1, nil
+	case "monthly":
+		return 2, nil
+	case "yearly", "annually":
+		return 3, nil
+	default:
+		return 0, fmt.Errorf("invalid recurrence %q; use daily, weekly, monthly, or yearly", value)
 	}
 }
 
@@ -526,6 +593,7 @@ type AddCmd struct {
 	List        string `short:"l" help:"List name or GUID"`
 	Description string `short:"d" help:"Description"`
 	Due         string `help:"Due date (e.g., 'tomorrow 14:00', '2024-01-20')"`
+	TimeZone    string `name:"timezone" help:"IANA timezone for due dates (persisted)"`
 	Priority    string `short:"p" help:"Priority: high, medium, low (default: none)"`
 	Parent      string `help:"Parent reminder ID or unique prefix"`
 }
@@ -552,13 +620,17 @@ func (c *AddCmd) Run() error {
 	}
 
 	// Parse due date
-	var dueDate *time.Time
+	var dueDate *cloudkit.DueDateChange
 	if c.Due != "" {
-		parsed, err := parseDueDate(c.Due)
+		location, zone, err := configuredTimeZone(c.TimeZone)
+		if err != nil {
+			return err
+		}
+		parsed, allDay, err := parseDueDate(c.Due, location)
 		if err != nil {
 			return fmt.Errorf("invalid due date: %w", err)
 		}
-		dueDate = &parsed
+		dueDate = &cloudkit.DueDateChange{Date: parsed, AllDay: allDay, TimeZone: zone}
 	}
 
 	// Parse priority
@@ -586,24 +658,24 @@ func (c *AddCmd) Run() error {
 	return nil
 }
 
-func parseDueDate(s string) (time.Time, error) {
+func parseDueDate(s string, location *time.Location) (time.Time, bool, error) {
 	s = strings.ToLower(strings.TrimSpace(s))
-	now := time.Now()
+	now := time.Now().In(location)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	// Handle relative dates
 	switch {
 	case s == "today":
-		return today.Add(18 * time.Hour), nil // Default to 6 PM
+		return today, true, nil
 	case s == "tomorrow":
-		return today.AddDate(0, 0, 1).Add(9 * time.Hour), nil // Default to 9 AM
+		return today.AddDate(0, 0, 1), true, nil
 	case strings.HasPrefix(s, "tomorrow "):
 		timeStr := strings.TrimPrefix(s, "tomorrow ")
 		t, err := time.Parse("15:04", timeStr)
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, false, err
 		}
-		return today.AddDate(0, 0, 1).Add(time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute), nil
+		return today.AddDate(0, 0, 1).Add(time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute), false, nil
 	default:
 		// Try various formats
 		formats := []string{
@@ -613,15 +685,52 @@ func parseDueDate(s string) (time.Time, error) {
 			"Jan 2",
 		}
 		for _, format := range formats {
-			if t, err := time.Parse(format, s); err == nil {
+			if t, err := time.ParseInLocation(format, s, location); err == nil {
 				if t.Year() == 0 {
 					t = time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
 				}
-				return t, nil
+				allDay := format == "2006-01-02" || format == "Jan 2"
+				return t, allDay, nil
 			}
 		}
-		return time.Time{}, fmt.Errorf("unrecognized format: %s", s)
+		return time.Time{}, false, fmt.Errorf("unrecognized format: %s", s)
 	}
+}
+
+func configuredTimeZone(override string) (*time.Location, string, error) {
+	settings, err := config.LoadSettings()
+	if err != nil {
+		return nil, "", fmt.Errorf("load settings: %w", err)
+	}
+	zone := strings.TrimSpace(override)
+	if zone == "" {
+		zone = strings.TrimSpace(settings.TimeZone)
+	}
+	if zone == "" {
+		zone = strings.TrimSpace(os.Getenv("TZ"))
+	}
+	if zone == "" {
+		if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
+			const marker = "/zoneinfo/"
+			if index := strings.Index(target, marker); index >= 0 {
+				zone = target[index+len(marker):]
+			}
+		}
+	}
+	if zone == "" || zone == "Local" {
+		return nil, "", fmt.Errorf("cannot determine an IANA timezone; pass --timezone, for example --timezone Europe/Paris")
+	}
+	location, err := time.LoadLocation(zone)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid IANA timezone %q: %w", zone, err)
+	}
+	if settings.TimeZone != zone {
+		settings.TimeZone = zone
+		if err := settings.Save(); err != nil {
+			return nil, "", fmt.Errorf("save timezone: %w", err)
+		}
+	}
+	return location, zone, nil
 }
 
 // DoneCmd submits an experimental completion mutation.
