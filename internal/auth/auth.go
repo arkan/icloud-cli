@@ -15,12 +15,13 @@ import (
 
 // Authenticator handles iCloud authentication flow
 type Authenticator struct {
-	client *api.Client
+	client       *api.Client
+	authEndpoint string
 }
 
 // NewAuthenticator creates a new authenticator
 func NewAuthenticator(client *api.Client) *Authenticator {
-	return &Authenticator{client: client}
+	return &Authenticator{client: client, authEndpoint: api.AuthEndpoint}
 }
 
 // SRPInitRequest is the request body for SRP init
@@ -108,7 +109,7 @@ func (a *Authenticator) SignIn(appleID, password string) error {
 	}
 
 	headers := a.client.AuthHeaders()
-	url := api.AuthEndpoint + "/signin/init"
+	url := a.authEndpoint + "/signin/init"
 
 	resp, body, err := a.client.Request("POST", url, initReq, headers)
 	if err != nil {
@@ -150,7 +151,7 @@ func (a *Authenticator) SignIn(appleID, password string) error {
 		completeReq.TrustTokens = []string{session.TrustToken}
 	}
 
-	url = api.AuthEndpoint + "/signin/complete?isRememberMeEnabled=true"
+	url = a.authEndpoint + "/signin/complete?isRememberMeEnabled=true"
 	resp, body, err = a.client.Request("POST", url, completeReq, headers)
 	if err != nil {
 		return fmt.Errorf("SRP complete request: %w", err)
@@ -167,7 +168,7 @@ func (a *Authenticator) SignIn(appleID, password string) error {
 
 	if resp.StatusCode == 412 {
 		// Non-2FA account, call repair endpoint
-		url = api.AuthEndpoint + "/repair/complete"
+		url = a.authEndpoint + "/repair/complete"
 		resp, body, err = a.client.Request("POST", url, map[string]interface{}{}, headers)
 		if err != nil {
 			return fmt.Errorf("repair complete request: %w", err)
@@ -288,7 +289,7 @@ func (a *Authenticator) Verify2FA(code string) error {
 	var req SecurityCodeRequest
 	req.SecurityCode.Code = code
 
-	url := api.AuthEndpoint + "/verify/trusteddevice/securitycode"
+	url := a.authEndpoint + "/verify/trusteddevice/securitycode"
 	headers := a.client.AuthHeaders()
 	headers["Accept"] = "application/json"
 
@@ -307,7 +308,7 @@ func (a *Authenticator) Verify2FA(code string) error {
 
 // TrustSession marks the session as trusted
 func (a *Authenticator) TrustSession() error {
-	url := api.AuthEndpoint + "/2sv/trust"
+	url := a.authEndpoint + "/2sv/trust"
 	headers := a.client.AuthHeaders()
 
 	resp, body, err := a.client.Request("GET", url, nil, headers)
@@ -325,7 +326,7 @@ func (a *Authenticator) TrustSession() error {
 
 // fetchAuthState retrieves the current auth state (triggers 2FA code sending)
 func (a *Authenticator) fetchAuthState() error {
-	url := api.AuthEndpoint
+	url := a.authEndpoint
 	headers := a.client.AuthHeaders()
 
 	resp, _, err := a.client.Request("GET", url, nil, headers)
@@ -348,7 +349,7 @@ func (a *Authenticator) RequestCode() error {
 	}
 
 	// Request code resend if needed
-	url := api.AuthEndpoint + "/verify/trusteddevice"
+	url := a.authEndpoint + "/verify/trusteddevice/securitycode"
 	headers := a.client.AuthHeaders()
 
 	resp, _, err := a.client.Request("PUT", url, nil, headers)
@@ -356,8 +357,9 @@ func (a *Authenticator) RequestCode() error {
 		return fmt.Errorf("request code: %w", err)
 	}
 
-	// 200 or 202 means code was sent
-	if resp.StatusCode != 200 && resp.StatusCode != 202 {
+	// Apple currently returns 204 for a successful push trigger. Older
+	// deployments have also returned 200 or 202.
+	if resp.StatusCode != 200 && resp.StatusCode != 202 && resp.StatusCode != 204 {
 		return fmt.Errorf("request code failed: %s", resp.Status)
 	}
 

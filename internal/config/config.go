@@ -11,6 +11,7 @@ const (
 	configDir    = ".icloud-cli"
 	sessionFile  = "session.json"
 	cookiesFile  = "cookies.json"
+	settingsFile = "config.json"
 )
 
 // Session holds authentication session data
@@ -25,6 +26,11 @@ type Session struct {
 	Dsid           string            `json:"dsid,omitempty"`
 	Webservices    map[string]string `json:"webservices,omitempty"`
 	Cookies        map[string]string `json:"cookies,omitempty"`
+}
+
+// Settings holds non-secret CLI preferences.
+type Settings struct {
+	TimeZone string `json:"timezone,omitempty"`
 }
 
 // ConfigPath returns the path to the config directory
@@ -94,6 +100,42 @@ func (s *Session) Save() error {
 	}
 
 	return os.WriteFile(path, data, 0600)
+}
+
+// LoadSettings loads non-secret CLI preferences.
+func LoadSettings() (*Settings, error) {
+	path, err := ConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(path, settingsFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Settings{}, nil
+		}
+		return nil, err
+	}
+	var settings Settings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, err
+	}
+	return &settings, nil
+}
+
+// Save persists non-secret CLI preferences.
+func (s *Settings) Save() error {
+	if err := EnsureConfigDir(); err != nil {
+		return err
+	}
+	path, err := ConfigPath()
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(path, settingsFile), data, 0600)
 }
 
 // Clear removes the session file

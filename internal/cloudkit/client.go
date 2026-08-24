@@ -133,35 +133,41 @@ func (c *Client) GetRecordTypes(container, env, database string, zoneID ZoneID) 
 
 // ChangesResponse is the response from zone changes
 type ChangesResponse struct {
-	Records   []Record `json:"records"`
-	SyncToken string   `json:"syncToken,omitempty"`
-	MoreComing bool    `json:"moreComing,omitempty"`
+	Records    []Record `json:"records"`
+	SyncToken  string   `json:"syncToken,omitempty"`
+	MoreComing bool     `json:"moreComing,omitempty"`
 }
 
-// FetchChanges fetches all records in a zone (initial sync)
+// FetchChanges fetches one page of changes from a custom zone.
 func (c *Client) FetchChanges(container, env, database string, zoneID ZoneID, syncToken string) (*ChangesResponse, error) {
-	path := c.buildPath(container, env, database, "records/changes")
-
-	reqBody := map[string]interface{}{
-		"zoneID":       zoneID,
-		"resultsLimit": 200,
+	path := c.buildPath(container, env, database, "changes/zone")
+	spec := ZoneChangesSpec{
+		ZoneID: zoneID,
+		DesiredKeys: []string{
+			"TitleDocument", "NotesDocument", "Name", "Completed",
+			"CompletionDate", "DueDate", "List", "Deleted", "Priority",
+			"ParentReminder", "Flagged", "CreationDate", "LastModifiedDate",
+			"ResolutionTokenMap", "UrgentPresentationAlarmsAsData",
+			"UrgentPresentationAlarmsChecksum",
+		},
 	}
 	if syncToken != "" {
-		reqBody["syncToken"] = syncToken
+		spec.SyncToken = syncToken
 	}
 
-	body, err := c.request("POST", path, reqBody)
+	body, err := c.request("POST", path, ZoneChangesRequest{Zones: []ZoneChangesSpec{spec}})
 	if err != nil {
 		return nil, fmt.Errorf("fetch changes: %w", err)
 	}
 
-	// Parse the response
-	var resp ChangesResponse
+	var resp ZoneChangesResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("parse changes response: %w", err)
 	}
-
-	return &resp, nil
+	if len(resp.Zones) == 0 {
+		return &ChangesResponse{}, nil
+	}
+	return &resp.Zones[0], nil
 }
 
 // LookupRecords fetches specific records by their record names
@@ -206,4 +212,53 @@ func (c *Client) ModifyRecords(container, env, database string, req ModifyReques
 	}
 
 	return &result, nil
+}
+
+// UploadAsset requests an upload URL, sends the bytes, and returns the value
+// required by the subsequent record mutation.
+func (c *Client) UploadAsset(container, env, database string, zoneID ZoneID, recordName, recordType, fieldName string, content []byte) (AssetValue, error) {
+	path := c.buildPath(container, env, database, "assets/upload")
+	request := AssetUploadRequest{ZoneID: zoneID, Tokens: []AssetUploadToken{{
+		RecordName: recordName, RecordType: recordType, FieldName: fieldName,
+	}}}
+	body, err := c.request("POST", path, request)
+	if err != nil {
+		return AssetValue{}, fmt.Errorf("request asset upload: %w", err)
+	}
+	var upload AssetUploadResponse
+	if err := json.Unmarshal(body, &upload); err != nil {
+		return AssetValue{}, fmt.Errorf("parse asset upload response: %w", err)
+	}
+	if len(upload.Tokens) != 1 || upload.Tokens[0].URL == "" {
+		return AssetValue{}, fmt.Errorf("asset upload returned no upload URL")
+	}
+	response, responseBody, err := c.apiClient.RequestBytes("POST", upload.Tokens[0].URL, content, nil)
+	if err != nil {
+		return AssetValue{}, fmt.Errorf("upload asset data: %w", err)
+	}
+	if response.StatusCode != 200 {
+		return AssetValue{}, fmt.Errorf("upload asset data: %s", response.Status)
+	}
+	var result struct {
+		SingleFile AssetValue `json:"singleFile"`
+	}
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		return AssetValue{}, fmt.Errorf("parse uploaded asset: %w", err)
+	}
+	if result.SingleFile.Receipt == "" {
+		return AssetValue{}, fmt.Errorf("uploaded asset returned no receipt")
+	}
+	return result.SingleFile, nil
+}
+
+// DownloadAsset fetches the bytes behind a signed CloudKit asset URL.
+func (c *Client) DownloadAsset(url string) ([]byte, error) {
+	response, body, err := c.apiClient.Request("GET", url, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("download asset: %w", err)
+	}
+	if response.StatusCode != 200 {
+		return nil, fmt.Errorf("download asset: %s", response.Status)
+	}
+	return body, nil
 }

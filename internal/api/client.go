@@ -112,6 +112,30 @@ func (c *Client) Request(method, url string, body interface{}, headers map[strin
 	return resp, respBody, nil
 }
 
+// RequestBytes sends an HTTP request with an unencoded byte body.
+func (c *Client) RequestBytes(method, url string, body []byte, headers map[string]string) (*http.Response, []byte, error) {
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, nil, fmt.Errorf("read response: %w", err)
+	}
+	c.captureSessionHeaders(resp)
+	return resp, responseBody, nil
+}
+
 // captureSessionHeaders extracts session data from response headers
 func (c *Client) captureSessionHeaders(resp *http.Response) {
 	if c.session == nil {
@@ -119,11 +143,11 @@ func (c *Client) captureSessionHeaders(resp *http.Response) {
 	}
 
 	headerMap := map[string]*string{
-		"X-Apple-ID-Account-Country":  &c.session.AccountCountry,
-		"X-Apple-ID-Session-Id":       &c.session.SessionID,
-		"X-Apple-Session-Token":       &c.session.SessionToken,
-		"X-Apple-TwoSV-Trust-Token":   &c.session.TrustToken,
-		"scnt":                        &c.session.Scnt,
+		"X-Apple-ID-Account-Country": &c.session.AccountCountry,
+		"X-Apple-ID-Session-Id":      &c.session.SessionID,
+		"X-Apple-Session-Token":      &c.session.SessionToken,
+		"X-Apple-TwoSV-Trust-Token":  &c.session.TrustToken,
+		"scnt":                       &c.session.Scnt,
 	}
 
 	for header, target := range headerMap {
@@ -149,16 +173,16 @@ func (c *Client) captureSessionHeaders(resp *http.Response) {
 // AuthHeaders returns headers required for authentication requests
 func (c *Client) AuthHeaders() map[string]string {
 	headers := map[string]string{
-		"Accept":                            "application/json, text/javascript",
-		"Content-Type":                      "application/json",
-		"User-Agent":                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		"X-Apple-OAuth-Client-Id":           WidgetKey,
-		"X-Apple-OAuth-Client-Type":         "firstPartyAuth",
-		"X-Apple-OAuth-Redirect-URI":        HomeEndpoint,
-		"X-Apple-OAuth-Require-Grant-Code":  "true",
-		"X-Apple-OAuth-Response-Mode":       "web_message",
-		"X-Apple-OAuth-Response-Type":       "code",
-		"X-Apple-Widget-Key":                WidgetKey,
+		"Accept":                           "application/json, text/javascript",
+		"Content-Type":                     "application/json",
+		"User-Agent":                       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		"X-Apple-OAuth-Client-Id":          WidgetKey,
+		"X-Apple-OAuth-Client-Type":        "firstPartyAuth",
+		"X-Apple-OAuth-Redirect-URI":       HomeEndpoint,
+		"X-Apple-OAuth-Require-Grant-Code": "true",
+		"X-Apple-OAuth-Response-Mode":      "web_message",
+		"X-Apple-OAuth-Response-Type":      "code",
+		"X-Apple-Widget-Key":               WidgetKey,
 		// Auth requests must use idmsa.apple.com as origin
 		"Origin":  AuthRootEndpoint,
 		"Referer": AuthRootEndpoint + "/",

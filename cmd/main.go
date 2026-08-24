@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -110,7 +113,7 @@ func handle2FA(authenticator *auth.Authenticator) error {
 	color.Yellow("→ Two-factor authentication required")
 	fmt.Println("A verification code has been sent to your trusted devices.")
 	fmt.Print("Enter code: ")
-	
+
 	var code string
 	fmt.Scanln(&code)
 	code = strings.TrimSpace(code)
@@ -161,11 +164,373 @@ func (c *StatusCmd) Run() error {
 
 // RemindersCmd is the parent command for reminders
 type RemindersCmd struct {
-	Lists ListsCmd `cmd:"" aliases:"ll" help:"List all reminder lists"`
-	Ls    LsCmd    `cmd:"" help:"List reminders"`
-	Add   AddCmd   `cmd:"" help:"Add a new reminder"`
-	Done  DoneCmd  `cmd:"" help:"Mark a reminder as done"`
-	Rm    RmCmd    `cmd:"" help:"Delete a reminder"`
+	Lists   ListsCmd   `cmd:"" aliases:"ll" help:"List all reminder lists"`
+	Ls      LsCmd      `cmd:"" help:"List reminders"`
+	Sharees ShareesCmd `cmd:"" help:"List accepted participants of a shared list"`
+	Add     AddCmd     `cmd:"" help:"Add a new reminder"`
+	Edit    EditCmd    `cmd:"" help:"Edit a reminder"`
+	Show    ShowCmd    `cmd:"" help:"Show reminder details"`
+	Done    DoneCmd    `cmd:"" help:"Mark a reminder as done"`
+	Rm      RmCmd      `cmd:"" help:"Delete a reminder"`
+}
+
+// EditCmd updates selected reminder fields.
+type EditCmd struct {
+	ID             string   `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
+	Title          string   `help:"Replacement title"`
+	Description    string   `short:"d" help:"Replacement description"`
+	Due            string   `help:"Replacement due date"`
+	ClearDue       bool     `help:"Remove the due date and its date alarm"`
+	TimeZone       string   `name:"timezone" help:"IANA timezone for due dates (persisted)"`
+	Priority       string   `short:"p" help:"Priority: high, medium, low, none"`
+	Flagged        bool     `help:"Set the flag"`
+	NoFlagged      bool     `name:"no-flagged" help:"Clear the flag"`
+	Tags           []string `name:"tag" help:"Add a native tag (repeatable)"`
+	RemoveTags     []string `name:"remove-tag" help:"Remove a native tag (repeatable)"`
+	Assign         string   `help:"Assign to a shared-list participant by name, email, or ID"`
+	Unassign       bool     `help:"Clear the current assignment"`
+	LocationTitle  string   `help:"Location alarm title"`
+	Address        string   `help:"Optional location alarm address"`
+	Latitude       *float64 `help:"Location alarm latitude"`
+	Longitude      *float64 `help:"Location alarm longitude"`
+	Radius         float64  `default:"100" help:"Location alarm radius in meters"`
+	Proximity      string   `default:"arriving" help:"Location alarm proximity: arriving or leaving"`
+	ClearLocation  bool     `help:"Remove the location alarm"`
+	URL            string   `help:"Set or replace the native URL attachment"`
+	ClearURL       bool     `help:"Remove the native URL attachment"`
+	Repeat         string   `help:"Repeat: daily, weekly, monthly, or yearly"`
+	RepeatInterval int      `default:"1" help:"Recurrence interval"`
+	RepeatUntil    string   `help:"Last recurrence date (YYYY-MM-DD)"`
+	ClearRepeat    bool     `help:"Remove recurrence"`
+	EarlyReminder  string   `name:"early-reminder" help:"Alert before due date (e.g. 15m, 1h, 2d, 1w, 1mo, or clear)"`
+	Urgent         bool     `help:"Enable the Urgent alarm"`
+	NoUrgent       bool     `name:"no-urgent" help:"Disable the Urgent alarm"`
+}
+
+func (c *EditCmd) Run() error {
+	svc, err := getRemindersService()
+	if err != nil {
+		return err
+	}
+	guid, err := resolveReminderID(svc, c.ID)
+	if err != nil {
+		return err
+	}
+
+	var title, description *string
+	if c.Title != "" {
+		title = &c.Title
+	}
+	if c.Description != "" {
+		description = &c.Description
+	}
+	var dueDate *cloudkit.DueDateChange
+	if c.Due != "" {
+		location, zone, err := configuredTimeZone(c.TimeZone)
+		if err != nil {
+			return err
+		}
+		parsed, allDay, err := parseDueDate(c.Due, location)
+		if err != nil {
+			return fmt.Errorf("invalid due date: %w", err)
+		}
+		dueDate = &cloudkit.DueDateChange{Date: parsed, AllDay: allDay, TimeZone: zone}
+	}
+	if dueDate != nil && c.ClearDue {
+		return fmt.Errorf("--due and --clear-due are mutually exclusive")
+	}
+	var priority *int
+	if c.Priority != "" {
+		value, err := parsePriority(c.Priority)
+		if err != nil {
+			return err
+		}
+		priority = &value
+	}
+	if c.Flagged && c.NoFlagged {
+		return fmt.Errorf("--flagged and --no-flagged are mutually exclusive")
+	}
+	if c.Assign != "" && c.Unassign {
+		return fmt.Errorf("--assign and --unassign are mutually exclusive")
+	}
+	locationRequested := c.LocationTitle != "" || c.Address != "" || c.Latitude != nil || c.Longitude != nil
+	if locationRequested && c.ClearLocation {
+		return fmt.Errorf("location options and --clear-location are mutually exclusive")
+	}
+	if c.URL != "" && c.ClearURL {
+		return fmt.Errorf("--url and --clear-url are mutually exclusive")
+	}
+	if c.Repeat != "" && c.ClearRepeat {
+		return fmt.Errorf("--repeat and --clear-repeat are mutually exclusive")
+	}
+	if c.Repeat == "" && c.RepeatUntil != "" {
+		return fmt.Errorf("--repeat-until requires --repeat")
+	}
+	var recurrence *cloudkit.RecurrenceRule
+	if c.Repeat != "" {
+		frequency, err := parseRecurrenceFrequency(c.Repeat)
+		if err != nil {
+			return err
+		}
+		if c.RepeatInterval < 1 || c.RepeatInterval > 999 {
+			return fmt.Errorf("--repeat-interval must be between 1 and 999")
+		}
+		recurrence = &cloudkit.RecurrenceRule{Frequency: frequency, Interval: c.RepeatInterval}
+		if c.RepeatUntil != "" {
+			location, _, err := configuredTimeZone(c.TimeZone)
+			if err != nil {
+				return err
+			}
+			end, err := time.ParseInLocation("2006-01-02", c.RepeatUntil, location)
+			if err != nil {
+				return fmt.Errorf("invalid recurrence end date: %w", err)
+			}
+			recurrence.EndDate = &end
+		}
+	}
+	earlyReminder, clearEarlyReminder, err := parseEarlyReminder(c.EarlyReminder)
+	if err != nil {
+		return err
+	}
+	urgent, err := urgentChange(c.Urgent, c.NoUrgent)
+	if err != nil {
+		return err
+	}
+	var location *cloudkit.LocationAlarm
+	if locationRequested {
+		if c.Latitude == nil || c.Longitude == nil {
+			return fmt.Errorf("location alarm requires --latitude and --longitude")
+		}
+		proximity, err := parseProximity(c.Proximity)
+		if err != nil {
+			return err
+		}
+		title := strings.TrimSpace(c.LocationTitle)
+		if title == "" {
+			title = "Location"
+		}
+		location = &cloudkit.LocationAlarm{
+			Title: title, Address: c.Address, Latitude: *c.Latitude, Longitude: *c.Longitude,
+			Radius: c.Radius, Proximity: proximity,
+		}
+	}
+	var flagged *bool
+	if c.Flagged || c.NoFlagged {
+		value := c.Flagged
+		flagged = &value
+	}
+	if title == nil && description == nil && dueDate == nil && !c.ClearDue && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL && recurrence == nil && !c.ClearRepeat && earlyReminder == nil && !clearEarlyReminder && urgent == nil {
+		return fmt.Errorf("no changes specified; use title, due-date, priority, flag, tag, assignment, location, URL, recurrence, early-reminder, or urgent options")
+	}
+	if title != nil || description != nil || priority != nil || flagged != nil {
+		changes := cloudkit.ReminderChanges{
+			Title: title, Notes: description, Priority: priority, Flagged: flagged,
+		}
+		if err := svc.Update(guid, changes); err != nil {
+			return fmt.Errorf("edit reminder: %w", err)
+		}
+	}
+	if dueDate != nil || c.ClearDue {
+		if err := svc.UpdateDueDate(guid, dueDate); err != nil {
+			return fmt.Errorf("edit reminder due date: %w", err)
+		}
+	}
+	if len(c.Tags) > 0 || len(c.RemoveTags) > 0 {
+		if err := svc.UpdateTags(guid, c.Tags, c.RemoveTags); err != nil {
+			return fmt.Errorf("edit reminder tags: %w", err)
+		}
+	}
+	if c.Assign != "" || c.Unassign {
+		if err := svc.UpdateAssignment(guid, c.Assign, c.Unassign); err != nil {
+			return fmt.Errorf("edit reminder assignment: %w", err)
+		}
+	}
+	if location != nil || c.ClearLocation {
+		if err := svc.UpdateLocationAlarm(guid, location); err != nil {
+			return fmt.Errorf("edit reminder location: %w", err)
+		}
+	}
+	if c.URL != "" || c.ClearURL {
+		if err := svc.UpdateURLAttachment(guid, c.URL); err != nil {
+			return fmt.Errorf("edit reminder URL: %w", err)
+		}
+	}
+	if recurrence != nil || c.ClearRepeat {
+		if err := svc.UpdateRecurrence(guid, recurrence); err != nil {
+			return fmt.Errorf("edit reminder recurrence: %w", err)
+		}
+	}
+	if earlyReminder != nil || clearEarlyReminder {
+		if err := svc.UpdateEarlyReminder(guid, earlyReminder); err != nil {
+			return fmt.Errorf("edit reminder early alert: %w", err)
+		}
+	}
+	if urgent != nil {
+		if err := svc.UpdateUrgent(guid, *urgent); err != nil {
+			return fmt.Errorf("edit reminder Urgent alarm: %w", err)
+		}
+	}
+	color.Green("✓ Update submitted")
+	return nil
+}
+
+func parseProximity(value string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "arriving", "arrive", "enter", "entering":
+		return 1, nil
+	case "leaving", "leave", "exit", "exiting":
+		return 2, nil
+	default:
+		return 0, fmt.Errorf("invalid proximity %q; use arriving or leaving", value)
+	}
+}
+
+func parseRecurrenceFrequency(value string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "daily":
+		return 0, nil
+	case "weekly":
+		return 1, nil
+	case "monthly":
+		return 2, nil
+	case "yearly", "annually":
+		return 3, nil
+	default:
+		return 0, fmt.Errorf("invalid recurrence %q; use daily, weekly, monthly, or yearly", value)
+	}
+}
+
+func parseEarlyReminder(value string) (*cloudkit.EarlyReminder, bool, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil, false, nil
+	}
+	if value == "clear" || value == "none" || value == "off" || value == "never" {
+		return nil, true, nil
+	}
+	unitCode := -1
+	number := value
+	for _, suffix := range []struct {
+		text string
+		unit int
+	}{{"mo", 4}, {"m", 0}, {"h", 1}, {"d", 2}, {"w", 3}} {
+		if strings.HasSuffix(value, suffix.text) {
+			unitCode = suffix.unit
+			number = strings.TrimSuffix(value, suffix.text)
+			break
+		}
+	}
+	count, err := strconv.Atoi(number)
+	if err != nil || unitCode < 0 || count < 1 || count > 999 {
+		return nil, false, fmt.Errorf("invalid early reminder %q; use a positive offset such as 15m, 1h, 2d, 1w, or 1mo", value)
+	}
+	return &cloudkit.EarlyReminder{Unit: unitCode, Count: count}, false, nil
+}
+
+func urgentChange(enable, disable bool) (*bool, error) {
+	if enable && disable {
+		return nil, fmt.Errorf("--urgent and --no-urgent are mutually exclusive")
+	}
+	if !enable && !disable {
+		return nil, nil
+	}
+	value := enable
+	return &value, nil
+}
+
+// ShareesCmd lists assignment candidates for one shared list.
+type ShareesCmd struct {
+	List string `arg:"" help:"Shared list name or GUID"`
+}
+
+func (c *ShareesCmd) Run() error {
+	svc, err := getRemindersService()
+	if err != nil {
+		return err
+	}
+	lists, err := svc.GetLists()
+	if err != nil {
+		return err
+	}
+	listID := ""
+	for _, list := range lists {
+		if strings.EqualFold(list.Title, c.List) || list.GUID == c.List {
+			if listID != "" {
+				return fmt.Errorf("multiple lists match %q; use the list GUID", c.List)
+			}
+			listID = list.GUID
+		}
+	}
+	if listID == "" {
+		return fmt.Errorf("list not found: %s", c.List)
+	}
+	sharees, err := svc.GetSharees(listID)
+	if err != nil {
+		return err
+	}
+	for _, sharee := range sharees {
+		name := sharee.DisplayName
+		if name == "" {
+			name = sharee.Email
+		}
+		marker := ""
+		if sharee.CurrentUser {
+			marker = " (me)"
+		}
+		fmt.Printf("%s%s\n", name, marker)
+		if sharee.Email != "" && !strings.EqualFold(name, sharee.Email) {
+			fmt.Printf("  %s\n", sharee.Email)
+		}
+		fmt.Printf("  ID: %s\n", sharee.ParticipantID)
+	}
+	return nil
+}
+
+func parsePriority(value string) (int, error) {
+	switch strings.ToLower(value) {
+	case "high", "h", "1":
+		return 1, nil
+	case "medium", "med", "m", "5":
+		return 5, nil
+	case "low", "l", "9":
+		return 9, nil
+	case "none", "0":
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("invalid priority %q; use high, medium, low, or none", value)
+	}
+}
+
+func resolveReminderID(svc *reminders.Service, id string) (string, error) {
+	if len(id) >= 36 {
+		return id, nil
+	}
+	items, err := svc.GetReminders("", true)
+	if err != nil {
+		return "", err
+	}
+	item, err := findReminderByID(items, id)
+	if err != nil {
+		return "", err
+	}
+	return item.RecordName, nil
+}
+
+func findReminderByID(items []reminders.ParsedReminder, id string) (reminders.ParsedReminder, error) {
+	query := strings.ToLower(id)
+	var matches []reminders.ParsedReminder
+	for _, item := range items {
+		if strings.HasPrefix(strings.ToLower(item.GUID), query) || strings.EqualFold(item.RecordName, id) {
+			matches = append(matches, item)
+		}
+	}
+	if len(matches) == 0 {
+		return reminders.ParsedReminder{}, fmt.Errorf("reminder not found: %s", id)
+	}
+	if len(matches) > 1 {
+		return reminders.ParsedReminder{}, fmt.Errorf("multiple reminders match %q; use a longer ID", id)
+	}
+	return matches[0], nil
 }
 
 // ListsCmd lists all reminder lists
@@ -201,6 +566,7 @@ func (c *ListsCmd) Run() error {
 type LsCmd struct {
 	List string `arg:"" optional:"" help:"List name or GUID (default: all)"`
 	All  bool   `short:"a" help:"Include completed reminders"`
+	Flat bool   `help:"Show subtasks as a flat list"`
 }
 
 func (c *LsCmd) Run() error {
@@ -227,7 +593,7 @@ func (c *LsCmd) Run() error {
 		}
 	}
 
-	reminders, err := svc.GetReminders(listGUID)
+	reminders, err := svc.GetReminders(listGUID, c.All)
 	if err != nil {
 		return fmt.Errorf("get reminders: %w", err)
 	}
@@ -237,49 +603,479 @@ func (c *LsCmd) Run() error {
 		return nil
 	}
 
-	fmt.Println()
-	for _, r := range reminders {
-		bullet := "○"
-		titleColor := color.New(color.FgWhite)
-		if r.Completed {
-			bullet = "✓"
-			titleColor = color.New(color.FgHiBlack, color.CrossedOut)
-		}
+	renderReminders(os.Stdout, reminders, c.Flat)
+	return nil
+}
 
-		// Priority indicator
-		priority := ""
-		switch r.Priority {
-		case 1:
-			priority = color.RedString(" !!!")
-		case 5:
-			priority = color.YellowString(" !!")
-		case 9:
-			priority = color.BlueString(" !")
-		}
+type reminderTreeNode struct {
+	reminder reminders.ParsedReminder
+	children []*reminderTreeNode
+}
 
-		fmt.Printf("  %s %s%s\n", bullet, titleColor.Sprint(r.Title), priority)
-		
-		// Due date
-		if r.DueDate != nil {
-			dueStr := formatDueDate(*r.DueDate)
-			if r.DueDate.Before(time.Now()) && !r.Completed {
-				fmt.Printf("    %s\n", color.RedString("⏰ %s (overdue)", dueStr))
-			} else {
-				fmt.Printf("    %s\n", color.HiBlackString("⏰ %s", dueStr))
+func renderReminders(writer io.Writer, items []reminders.ParsedReminder, flat bool) {
+	fmt.Fprintln(writer)
+	if flat {
+		for _, item := range items {
+			renderReminder(writer, item, "", "", true)
+		}
+		fmt.Fprintln(writer)
+		return
+	}
+
+	nodes := make([]*reminderTreeNode, 0, len(items))
+	byRecordName := make(map[string]*reminderTreeNode, len(items))
+	for _, item := range items {
+		node := &reminderTreeNode{reminder: item}
+		nodes = append(nodes, node)
+		byRecordName[item.RecordName] = node
+	}
+	var roots []*reminderTreeNode
+	for _, node := range nodes {
+		parent := byRecordName[node.reminder.ParentRecordName]
+		if parent == nil || parent == node {
+			roots = append(roots, node)
+			continue
+		}
+		parent.children = append(parent.children, node)
+	}
+
+	rendered := make(map[*reminderTreeNode]bool, len(nodes))
+	for _, root := range roots {
+		renderReminderTree(writer, root, "", "", true, rendered)
+	}
+	// Cyclic or malformed parent references must not hide reminders.
+	for _, node := range nodes {
+		if !rendered[node] {
+			renderReminderTree(writer, node, "", "", true, rendered)
+		}
+	}
+	fmt.Fprintln(writer)
+}
+
+func renderReminderTree(writer io.Writer, node *reminderTreeNode, prefix, connector string, last bool, rendered map[*reminderTreeNode]bool) {
+	if rendered[node] {
+		return
+	}
+	rendered[node] = true
+	renderReminder(writer, node.reminder, prefix, connector, last)
+	childPrefix := prefix
+	if connector != "" {
+		if last {
+			childPrefix += "   "
+		} else {
+			childPrefix += "│  "
+		}
+	}
+	for index, child := range node.children {
+		isLast := index == len(node.children)-1
+		branch := "├─"
+		if isLast {
+			branch = "└─"
+		}
+		renderReminderTree(writer, child, childPrefix, branch, isLast, rendered)
+	}
+}
+
+func renderReminder(writer io.Writer, r reminders.ParsedReminder, prefix, connector string, last bool) {
+	bullet := "○"
+	titleColor := color.New(color.FgWhite)
+	if r.Completed {
+		bullet = "✓"
+		titleColor = color.New(color.FgHiBlack, color.CrossedOut)
+	}
+
+	// Priority indicator
+	priority := ""
+	switch r.Priority {
+	case 1:
+		priority = color.RedString(" !!!")
+	case 5:
+		priority = color.YellowString(" !!")
+	case 9:
+		priority = color.BlueString(" !")
+	}
+
+	linePrefix := "  " + prefix
+	if connector != "" {
+		linePrefix += connector + " "
+	}
+	fmt.Fprintf(writer, "%s%s %s%s\n", linePrefix, bullet, titleColor.Sprint(r.Title), priority)
+	detailPrefix := "    "
+	if connector != "" {
+		detailPrefix = "  " + prefix
+		if last {
+			detailPrefix += "   "
+		} else {
+			detailPrefix += "│  "
+		}
+		detailPrefix += "  "
+	}
+
+	// Due date
+	if r.DueDate != nil {
+		dueStr := formatDueDate(*r.DueDate)
+		if r.DueDate.Before(time.Now()) && !r.Completed {
+			fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.RedString("⏰ %s (overdue)", dueStr))
+		} else {
+			fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.HiBlackString("⏰ %s", dueStr))
+		}
+	}
+
+	// Description
+	if r.Description != "" {
+		fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.HiBlackString(r.Description))
+	}
+
+	// GUID for reference
+	fmt.Fprintf(writer, "%s%s\n", detailPrefix, color.HiBlackString("ID: %s", shortReminderID(r.GUID)))
+}
+
+func shortReminderID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+type reminderShowView struct {
+	Reminder   reminders.ParsedReminder
+	ListName   string
+	Parent     *reminders.ParsedReminder
+	Subtasks   []reminders.ParsedReminder
+	Properties cloudkit.ReminderProperties
+}
+
+// ShowCmd displays one reminder selected by full ID or unique prefix.
+type ShowCmd struct {
+	ID      string `arg:"" help:"Reminder ID (unique prefix or full ID)"`
+	JSON    bool   `help:"Show stable JSON output"`
+	Raw     bool   `help:"Show the raw CloudKit record as JSON"`
+	NoColor bool   `name:"no-color" help:"Disable colors in human-readable output"`
+}
+
+func (c *ShowCmd) Run() error {
+	if c.JSON && c.Raw {
+		return fmt.Errorf("--json and --raw are mutually exclusive")
+	}
+	svc, err := getRemindersService()
+	if err != nil {
+		return err
+	}
+	items, err := svc.GetReminders("", true)
+	if err != nil {
+		return fmt.Errorf("get reminders: %w", err)
+	}
+	selected, err := findReminderByID(items, c.ID)
+	if err != nil {
+		return err
+	}
+	if c.Raw {
+		record, err := svc.GetRawReminder(selected.RecordName)
+		if err != nil {
+			return err
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(record)
+	}
+
+	view := buildReminderShowView(selected, items)
+	properties, err := svc.GetReminderProperties(selected.RecordName)
+	if err != nil {
+		return err
+	}
+	view.Properties = properties
+	lists, err := svc.GetLists()
+	if err != nil {
+		return fmt.Errorf("get lists: %w", err)
+	}
+	for _, list := range lists {
+		if list.GUID == selected.ListGUID {
+			view.ListName = list.Title
+			break
+		}
+	}
+	if view.ListName == "" {
+		view.ListName = selected.ListGUID
+	}
+	if view.Properties.Assignee != "" {
+		if sharees, shareErr := svc.GetSharees(selected.ListGUID); shareErr == nil {
+			for _, sharee := range sharees {
+				if sharee.ParticipantID != view.Properties.Assignee {
+					continue
+				}
+				name := sharee.DisplayName
+				if name == "" {
+					name = sharee.Email
+				}
+				if sharee.CurrentUser {
+					name += " (me)"
+				}
+				if name != "" {
+					view.Properties.Assignee = name
+				}
+				break
 			}
 		}
-
-		// Description
-		if r.Description != "" {
-			fmt.Printf("    %s\n", color.HiBlackString(r.Description))
-		}
-
-		// GUID for reference
-		fmt.Printf("    %s\n", color.HiBlackString("ID: %s", r.GUID[:8]))
 	}
-	fmt.Println()
-
+	if c.JSON {
+		return renderReminderShowJSON(os.Stdout, view)
+	}
+	renderReminderShowText(os.Stdout, view, c.NoColor)
 	return nil
+}
+
+func buildReminderShowView(selected reminders.ParsedReminder, items []reminders.ParsedReminder) reminderShowView {
+	view := reminderShowView{Reminder: selected}
+	for index := range items {
+		item := &items[index]
+		if item.RecordName == selected.ParentRecordName {
+			view.Parent = item
+		}
+		if item.ParentRecordName == selected.RecordName {
+			view.Subtasks = append(view.Subtasks, *item)
+		}
+	}
+	return view
+}
+
+type reminderShowJSON struct {
+	ID             string                     `json:"id"`
+	RecordName     string                     `json:"recordName"`
+	Title          string                     `json:"title"`
+	Notes          string                     `json:"notes"`
+	List           string                     `json:"list"`
+	Parent         *reminderShowJSONReference `json:"parent"`
+	Completed      bool                       `json:"completed"`
+	CompletionDate *time.Time                 `json:"completionDate"`
+	Priority       string                     `json:"priority"`
+	Flagged        bool                       `json:"flagged"`
+	Due            *time.Time                 `json:"due"`
+	CreatedDate    *time.Time                 `json:"createdDate"`
+	ModifiedDate   *time.Time                 `json:"modifiedDate"`
+	URL            string                     `json:"url"`
+	Tags           []string                   `json:"tags"`
+	Assigned       string                     `json:"assigned"`
+	TimeZone       string                     `json:"timeZone"`
+	AllDay         bool                       `json:"allDay"`
+	Location       *reminderShowJSONLocation  `json:"location"`
+	Repeat         string                     `json:"repeat"`
+	Early          string                     `json:"earlyReminder"`
+	Urgent         *bool                      `json:"urgent"`
+	Subtasks       []reminderShowJSONSummary  `json:"subtasks"`
+}
+
+type reminderShowJSONReference struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+type reminderShowJSONSummary struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Completed bool   `json:"completed"`
+}
+
+type reminderShowJSONLocation struct {
+	Title     string  `json:"title,omitempty"`
+	Address   string  `json:"address,omitempty"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Radius    float64 `json:"radius"`
+	Proximity string  `json:"proximity"`
+}
+
+func renderReminderShowJSON(writer io.Writer, view reminderShowView) error {
+	document := reminderShowJSON{
+		ID: view.Reminder.GUID, RecordName: view.Reminder.RecordName,
+		Title: view.Reminder.Title, Notes: view.Reminder.Description, List: view.ListName,
+		Completed: view.Reminder.Completed, CompletionDate: view.Reminder.CompletionDate,
+		Priority: reminderPriorityName(view.Reminder.Priority),
+		Flagged:  view.Reminder.Flagged, Due: view.Reminder.DueDate,
+		URL: view.Properties.URL, Tags: append([]string{}, view.Properties.Tags...),
+		Assigned: view.Properties.Assignee, TimeZone: view.Properties.TimeZone,
+		AllDay: view.Properties.AllDay,
+		Repeat: formatRecurrence(view.Properties.Recurrence), Early: formatEarlyReminder(view.Properties.EarlyReminder),
+		Urgent:   view.Properties.Urgent,
+		Subtasks: make([]reminderShowJSONSummary, 0, len(view.Subtasks)),
+	}
+	if location := view.Properties.Location; location != nil {
+		document.Location = &reminderShowJSONLocation{
+			Title: location.Title, Address: location.Address, Latitude: location.Latitude,
+			Longitude: location.Longitude, Radius: location.Radius,
+			Proximity: map[int]string{1: "arriving", 2: "leaving"}[location.Proximity],
+		}
+	}
+	if !view.Reminder.CreatedDate.IsZero() {
+		document.CreatedDate = &view.Reminder.CreatedDate
+	}
+	if !view.Reminder.ModifiedDate.IsZero() {
+		document.ModifiedDate = &view.Reminder.ModifiedDate
+	}
+	if view.Parent != nil {
+		document.Parent = &reminderShowJSONReference{ID: view.Parent.GUID, Title: view.Parent.Title}
+	}
+	for _, subtask := range view.Subtasks {
+		document.Subtasks = append(document.Subtasks, reminderShowJSONSummary{
+			ID: subtask.GUID, Title: subtask.Title, Completed: subtask.Completed,
+		})
+	}
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(document)
+}
+
+func reminderPriorityName(priority int) string {
+	if name, ok := map[int]string{0: "none", 1: "high", 5: "medium", 9: "low"}[priority]; ok {
+		return name
+	}
+	return strconv.Itoa(priority)
+}
+
+func renderReminderShowText(writer io.Writer, view reminderShowView, noColor bool) {
+	label := func(value string) string {
+		style := color.New(color.Bold)
+		if noColor {
+			style.DisableColor()
+		}
+		return style.Sprint(value)
+	}
+	value := func(text string) string {
+		style := color.New(color.FgCyan)
+		if noColor {
+			style.DisableColor()
+		}
+		return style.Sprint(text)
+	}
+	yesNo := func(enabled bool) string {
+		if enabled {
+			return "yes"
+		}
+		return "no"
+	}
+	orDash := func(text string) string {
+		if text == "" {
+			return "—"
+		}
+		return text
+	}
+	priority := reminderPriorityName(view.Reminder.Priority)
+
+	fmt.Fprintf(writer, "%s %s\n", label("Title:     "), value(view.Reminder.Title))
+	fmt.Fprintf(writer, "%s %s\n", label("ID:        "), view.Reminder.GUID)
+	fmt.Fprintf(writer, "%s %s\n", label("List:      "), view.ListName)
+	parent := "—"
+	if view.Parent != nil {
+		parent = fmt.Sprintf("%s (%s)", view.Parent.Title, shortReminderID(view.Parent.GUID))
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Parent:    "), parent)
+	fmt.Fprintf(writer, "%s %s\n", label("Completed: "), yesNo(view.Reminder.Completed))
+	completedAt := "—"
+	if view.Reminder.CompletionDate != nil {
+		completedAt = view.Reminder.CompletionDate.Format(time.RFC3339)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Completed at:"), completedAt)
+	fmt.Fprintf(writer, "%s %s\n", label("Priority:  "), priority)
+	fmt.Fprintf(writer, "%s %s\n", label("Flagged:   "), yesNo(view.Reminder.Flagged))
+	due := "—"
+	if view.Reminder.DueDate != nil {
+		due = view.Reminder.DueDate.Format("2006-01-02 15:04 MST")
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Due:       "), due)
+	fmt.Fprintf(writer, "%s %s\n", label("Timezone:  "), orDash(view.Properties.TimeZone))
+	allDay := "—"
+	if view.Reminder.DueDate != nil {
+		allDay = yesNo(view.Properties.AllDay)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("All day:   "), allDay)
+	fmt.Fprintf(writer, "%s %s\n", label("URL:       "), orDash(view.Properties.URL))
+	fmt.Fprintf(writer, "%s %s\n", label("Tags:      "), orDash(strings.Join(view.Properties.Tags, ", ")))
+	fmt.Fprintf(writer, "%s %s\n", label("Assigned:  "), orDash(view.Properties.Assignee))
+	locationText := "—"
+	if location := view.Properties.Location; location != nil {
+		proximity := map[int]string{1: "arriving", 2: "leaving"}[location.Proximity]
+		locationText = location.Title
+		if locationText == "" {
+			locationText = location.Address
+		} else if location.Address != "" {
+			locationText += " — " + location.Address
+		}
+		if proximity != "" {
+			locationText += " (" + proximity + ")"
+		}
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Location:  "), locationText)
+	fmt.Fprintf(writer, "%s %s\n", label("Repeat:    "), orDash(formatRecurrence(view.Properties.Recurrence)))
+	fmt.Fprintf(writer, "%s %s\n", label("Early:     "), orDash(formatEarlyReminder(view.Properties.EarlyReminder)))
+	urgent := "—"
+	if view.Properties.Urgent != nil {
+		urgent = yesNo(*view.Properties.Urgent)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Urgent:    "), urgent)
+	created := "—"
+	if !view.Reminder.CreatedDate.IsZero() {
+		created = view.Reminder.CreatedDate.Format(time.RFC3339)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Created:   "), created)
+	modified := "—"
+	if !view.Reminder.ModifiedDate.IsZero() {
+		modified = view.Reminder.ModifiedDate.Format(time.RFC3339)
+	}
+	fmt.Fprintf(writer, "%s %s\n", label("Modified:  "), modified)
+	if view.Reminder.Description != "" {
+		fmt.Fprintf(writer, "%s\n  %s\n", label("Notes:"), view.Reminder.Description)
+	} else {
+		fmt.Fprintf(writer, "%s %s\n", label("Notes:     "), "—")
+	}
+	if len(view.Subtasks) > 0 {
+		fmt.Fprintf(writer, "%s\n", label("Subtasks:"))
+		for index, subtask := range view.Subtasks {
+			branch := "├─"
+			if index == len(view.Subtasks)-1 {
+				branch = "└─"
+			}
+			marker := "○"
+			if subtask.Completed {
+				marker = "✓"
+			}
+			fmt.Fprintf(writer, "  %s %s %s (%s)\n", branch, marker, subtask.Title, shortReminderID(subtask.GUID))
+		}
+	} else {
+		fmt.Fprintf(writer, "%s %s\n", label("Subtasks:  "), "—")
+	}
+}
+
+func formatRecurrence(rule *cloudkit.RecurrenceRule) string {
+	if rule == nil {
+		return ""
+	}
+	unit := map[int]string{0: "day", 1: "week", 2: "month", 3: "year"}[rule.Frequency]
+	if unit == "" {
+		unit = "unknown"
+	}
+	interval := rule.Interval
+	if interval < 1 {
+		interval = 1
+	}
+	text := "every " + unit
+	if interval > 1 {
+		text = fmt.Sprintf("every %d %ss", interval, unit)
+	}
+	if rule.EndDate != nil {
+		text += " until " + rule.EndDate.Format("2006-01-02")
+	}
+	return text
+}
+
+func formatEarlyReminder(alert *cloudkit.EarlyReminder) string {
+	if alert == nil {
+		return ""
+	}
+	unit := map[int]string{0: "minute", 1: "hour", 2: "day", 3: "week", 4: "month"}[alert.Unit]
+	if alert.Count != 1 {
+		unit += "s"
+	}
+	return fmt.Sprintf("%d %s", alert.Count, unit)
 }
 
 func formatDueDate(t time.Time) string {
@@ -302,11 +1098,15 @@ func formatDueDate(t time.Time) string {
 
 // AddCmd adds a new reminder
 type AddCmd struct {
-	Title       string `arg:"" help:"Reminder title"`
-	List        string `short:"l" help:"List name or GUID"`
-	Description string `short:"d" help:"Description"`
-	Due         string `help:"Due date (e.g., 'tomorrow 14:00', '2024-01-20')"`
-	Priority    string `short:"p" help:"Priority: high, medium, low (default: none)"`
+	Title         string `arg:"" help:"Reminder title"`
+	List          string `short:"l" help:"List name or GUID"`
+	Description   string `short:"d" help:"Description"`
+	Due           string `help:"Due date (e.g., 'tomorrow 14:00', '2024-01-20')"`
+	TimeZone      string `name:"timezone" help:"IANA timezone for due dates (persisted)"`
+	Priority      string `short:"p" help:"Priority: high, medium, low (default: none)"`
+	Parent        string `help:"Parent reminder ID or unique prefix"`
+	EarlyReminder string `name:"early-reminder" help:"Alert before due date (e.g. 15m, 1h, 2d, 1w, or 1mo)"`
+	Urgent        bool   `help:"Enable the Urgent alarm"`
 }
 
 func (c *AddCmd) Run() error {
@@ -331,27 +1131,48 @@ func (c *AddCmd) Run() error {
 	}
 
 	// Parse due date
-	var dueDate *time.Time
+	var dueDate *cloudkit.DueDateChange
 	if c.Due != "" {
-		parsed, err := parseDueDate(c.Due)
+		location, zone, err := configuredTimeZone(c.TimeZone)
+		if err != nil {
+			return err
+		}
+		parsed, allDay, err := parseDueDate(c.Due, location)
 		if err != nil {
 			return fmt.Errorf("invalid due date: %w", err)
 		}
-		dueDate = &parsed
+		dueDate = &cloudkit.DueDateChange{Date: parsed, AllDay: allDay, TimeZone: zone}
 	}
 
 	// Parse priority
 	priority := 0
-	switch strings.ToLower(c.Priority) {
-	case "high", "h", "1":
-		priority = 1
-	case "medium", "med", "m", "5":
-		priority = 5
-	case "low", "l", "9":
-		priority = 9
+	if c.Priority != "" {
+		priority, err = parsePriority(c.Priority)
+		if err != nil {
+			return err
+		}
 	}
 
-	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority); err != nil {
+	var parentGUID string
+	if c.Parent != "" {
+		parentGUID, err = resolveReminderID(svc, c.Parent)
+		if err != nil {
+			return fmt.Errorf("resolve parent reminder: %w", err)
+		}
+	}
+
+	earlyReminder, clearEarlyReminder, err := parseEarlyReminder(c.EarlyReminder)
+	if err != nil {
+		return err
+	}
+	if clearEarlyReminder {
+		return fmt.Errorf("--early-reminder clear is only valid when editing a reminder")
+	}
+	if earlyReminder != nil && dueDate == nil {
+		return fmt.Errorf("--early-reminder requires --due when adding a reminder")
+	}
+
+	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority, parentGUID, earlyReminder, c.Urgent); err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
 
@@ -359,24 +1180,24 @@ func (c *AddCmd) Run() error {
 	return nil
 }
 
-func parseDueDate(s string) (time.Time, error) {
+func parseDueDate(s string, location *time.Location) (time.Time, bool, error) {
 	s = strings.ToLower(strings.TrimSpace(s))
-	now := time.Now()
+	now := time.Now().In(location)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 
 	// Handle relative dates
 	switch {
 	case s == "today":
-		return today.Add(18 * time.Hour), nil // Default to 6 PM
+		return today, true, nil
 	case s == "tomorrow":
-		return today.AddDate(0, 0, 1).Add(9 * time.Hour), nil // Default to 9 AM
+		return today.AddDate(0, 0, 1), true, nil
 	case strings.HasPrefix(s, "tomorrow "):
 		timeStr := strings.TrimPrefix(s, "tomorrow ")
 		t, err := time.Parse("15:04", timeStr)
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, false, err
 		}
-		return today.AddDate(0, 0, 1).Add(time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute), nil
+		return today.AddDate(0, 0, 1).Add(time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute), false, nil
 	default:
 		// Try various formats
 		formats := []string{
@@ -386,18 +1207,55 @@ func parseDueDate(s string) (time.Time, error) {
 			"Jan 2",
 		}
 		for _, format := range formats {
-			if t, err := time.Parse(format, s); err == nil {
+			if t, err := time.ParseInLocation(format, s, location); err == nil {
 				if t.Year() == 0 {
 					t = time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
 				}
-				return t, nil
+				allDay := format == "2006-01-02" || format == "Jan 2"
+				return t, allDay, nil
 			}
 		}
-		return time.Time{}, fmt.Errorf("unrecognized format: %s", s)
+		return time.Time{}, false, fmt.Errorf("unrecognized format: %s", s)
 	}
 }
 
-// DoneCmd marks a reminder as complete
+func configuredTimeZone(override string) (*time.Location, string, error) {
+	settings, err := config.LoadSettings()
+	if err != nil {
+		return nil, "", fmt.Errorf("load settings: %w", err)
+	}
+	zone := strings.TrimSpace(override)
+	if zone == "" {
+		zone = strings.TrimSpace(settings.TimeZone)
+	}
+	if zone == "" {
+		zone = strings.TrimSpace(os.Getenv("TZ"))
+	}
+	if zone == "" {
+		if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
+			const marker = "/zoneinfo/"
+			if index := strings.Index(target, marker); index >= 0 {
+				zone = target[index+len(marker):]
+			}
+		}
+	}
+	if zone == "" || zone == "Local" {
+		return nil, "", fmt.Errorf("cannot determine an IANA timezone; pass --timezone, for example --timezone Europe/Paris")
+	}
+	location, err := time.LoadLocation(zone)
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid IANA timezone %q: %w", zone, err)
+	}
+	if settings.TimeZone != zone {
+		settings.TimeZone = zone
+		if err := settings.Save(); err != nil {
+			return nil, "", fmt.Errorf("save timezone: %w", err)
+		}
+	}
+	return location, zone, nil
+}
+
+// DoneCmd marks a reminder as complete.
 type DoneCmd struct {
 	ID string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
 }
@@ -407,27 +1265,14 @@ func (c *DoneCmd) Run() error {
 	if err != nil {
 		return err
 	}
-
-	// Find full GUID if partial
-	guid := c.ID
-	if len(guid) < 36 {
-		reminders, err := svc.GetReminders("")
-		if err != nil {
-			return err
-		}
-		for _, r := range reminders {
-			if strings.HasPrefix(r.GUID, guid) {
-				guid = r.GUID
-				break
-			}
-		}
+	guid, err := resolveReminderID(svc, c.ID)
+	if err != nil {
+		return err
 	}
-
 	if err := svc.Complete(guid); err != nil {
 		return fmt.Errorf("complete reminder: %w", err)
 	}
-
-	color.Green("✓ Marked as done")
+	color.Green("✓ Completion submitted")
 	return nil
 }
 
@@ -442,19 +1287,9 @@ func (c *RmCmd) Run() error {
 		return err
 	}
 
-	// Find full GUID if partial
-	guid := c.ID
-	if len(guid) < 36 {
-		reminders, err := svc.GetReminders("")
-		if err != nil {
-			return err
-		}
-		for _, r := range reminders {
-			if strings.HasPrefix(r.GUID, guid) {
-				guid = r.GUID
-				break
-			}
-		}
+	guid, err := resolveReminderID(svc, c.ID)
+	if err != nil {
+		return err
 	}
 
 	if err := svc.Delete(guid); err != nil {
