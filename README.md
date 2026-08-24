@@ -17,6 +17,7 @@ CloudKit web service used by iCloud.com.
 - Add reminders with notes, due dates, and priorities
 - Create subtasks, manage native tags, set or clear flags, assign shared reminders, and manage location alarms
 - Set or clear due dates and native daily, weekly, monthly, or yearly recurrence
+- Add, replace, or clear native Early Reminders relative to a due date
 - Edit titles, notes, due dates, and priorities (text updates are experimental)
 - Mark reminders complete (experimental)
 - Delete reminders
@@ -71,6 +72,8 @@ icloud reminders edit ABC12345 --repeat daily
 icloud reminders edit ABC12345 --repeat weekly --repeat-interval 2
 icloud reminders edit ABC12345 --repeat monthly --repeat-until 2026-12-31
 icloud reminders edit ABC12345 --clear-repeat
+icloud reminders edit ABC12345 --early-reminder 15m
+icloud reminders edit ABC12345 --early-reminder clear
 icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
@@ -150,8 +153,12 @@ and renders correctly. A dedicated test account is recommended.
   asset upload followed by an undocumented `Attachment` record mutation. The
   only verified writer found uses Apple's private ReminderKit on macOS, so no
   cross-platform contract has been validated on an Apple device.
-- A timed due date creates its native date alarm. Early-reminder offsets are not
-  yet exposed separately.
+- A timed due date creates its native date alarm. Early Reminder creation,
+  replacement, and removal are verified in the native iPhone app. Accepted
+  units are minutes (`m`), hours (`h`), days (`d`), weeks (`w`), and months
+  (`mo`). Apple stores a private account UUID only inside this metadata; if an
+  account has never synchronized a native Early Reminder, create one once in
+  Reminders before the CLI can discover that identifier.
 - The “When Messaging” trigger is not supported. CloudKit exposes its encrypted
   `ContactHandles` field, but direct writes and removals did not materialize
   reliably in the native iPhone app; the state also depends on local

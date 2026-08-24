@@ -1020,6 +1020,76 @@ func TestClearRecurrenceDeletesNativeRule(t *testing.T) {
 	}
 }
 
+func TestUpdateEarlyReminderWritesNativeEnvelopeAndToken(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"DueDate":{"value":1787904000000,"type":"TIMESTAMP"},"ResolutionTokenMap":{"value":"{\"map\":{\"lastModifiedDate\":{\"counter\":1,\"modificationTime\":1,\"replicaID\":\"R\"}}}"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(RecordsResponse{Records: []Record{modify.Operations[0].Record}})
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	baseline, err := json.Marshal(dueDateDeltaAlertsEnvelope{AccountIdentifier: "ACCOUNT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.records["Reminder/BASELINE"] = Record{RecordName: "Reminder/BASELINE", RecordType: "Reminder", Fields: map[string]FieldValue{
+		"DueDateDeltaAlertsData": {Value: base64.StdEncoding.EncodeToString(baseline), Type: "ENCRYPTED_BYTES"},
+	}}
+	if err := service.UpdateEarlyReminder("Reminder/R1", &EarlyReminder{Unit: 0, Count: 15}); err != nil {
+		t.Fatalf("UpdateEarlyReminder: %v", err)
+	}
+	if len(modify.Operations) != 1 || modify.Operations[0].OperationType != OperationUpdate {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	fields := modify.Operations[0].Record.Fields
+	if fields["DueDateDeltaAlertsData"].Type != "ENCRYPTED_BYTES" {
+		t.Fatalf("delta field = %#v", fields["DueDateDeltaAlertsData"])
+	}
+	encoded := fields["DueDateDeltaAlertsData"].Value.(string)
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope dueDateDeltaAlertsEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.AccountIdentifier != "ACCOUNT" || envelope.ReminderIdentifier != "R1" || envelope.MinimumSupportedVersion != 20230430 || len(envelope.DueDateDeltaAlerts) != 1 {
+		t.Fatalf("envelope = %#v", envelope)
+	}
+	alert := envelope.DueDateDeltaAlerts[0]
+	if alert.DueDateDeltaUnit != 0 || alert.DueDateDeltaCount != -15 || alert.Identifier == "" {
+		t.Errorf("alert = %#v", alert)
+	}
+	var tokens struct {
+		Map map[string]json.RawMessage `json:"map"`
+	}
+	if err := json.Unmarshal([]byte(fields["ResolutionTokenMap"].Value.(string)), &tokens); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tokens.Map["dueDateDeltaAlertsData"]; !ok {
+		t.Errorf("tokens = %#v", tokens.Map)
+	}
+}
+
 func TestClearLocationAlarmPreservesOtherAlarmTypes(t *testing.T) {
 	t.Parallel()
 

@@ -117,7 +117,7 @@ func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]Par
 }
 
 // Add creates a new reminder via CloudKit
-func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.DueDateChange, priority int, parentGUID string) error {
+func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.DueDateChange, priority int, parentGUID string, earlyReminder *cloudkit.EarlyReminder) error {
 	// If no list specified, use the first available list
 	if listGUID == "" && parentGUID == "" {
 		lists, err := s.cloudkitSvc.GetLists()
@@ -139,6 +139,11 @@ func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.Due
 			return fmt.Errorf("set reminder due date: %w", err)
 		}
 	}
+	if earlyReminder != nil {
+		if err := s.cloudkitSvc.UpdateEarlyReminder(created.ID, earlyReminder); err != nil {
+			return fmt.Errorf("set reminder early alert: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -155,6 +160,14 @@ func (s *Service) UpdateDueDate(reminderGUID string, due *cloudkit.DueDateChange
 func (s *Service) UpdateRecurrence(reminderGUID string, recurrence *cloudkit.RecurrenceRule) error {
 	if err := s.cloudkitSvc.UpdateRecurrence(reminderGUID, recurrence); err != nil {
 		return fmt.Errorf("update recurrence: %w", err)
+	}
+	return nil
+}
+
+// UpdateEarlyReminder replaces or clears the reminder's early alert.
+func (s *Service) UpdateEarlyReminder(reminderGUID string, alert *cloudkit.EarlyReminder) error {
+	if err := s.cloudkitSvc.UpdateEarlyReminder(reminderGUID, alert); err != nil {
+		return fmt.Errorf("update early reminder: %w", err)
 	}
 	return nil
 }

@@ -88,6 +88,12 @@ type RecurrenceRule struct {
 	EndDate   *time.Time
 }
 
+// EarlyReminder describes an alert offset before the reminder's due date.
+type EarlyReminder struct {
+	Unit  int
+	Count int
+}
+
 // LocationAlarm describes a geofence trigger for a reminder.
 type LocationAlarm struct {
 	Title     string
@@ -1766,6 +1772,123 @@ func recurrenceEndDate(reminder Record, selected time.Time) (time.Time, error) {
 		return time.Date(selected.Year(), selected.Month(), selected.Day()+1, 0, 0, 0, 0, location).Add(-time.Minute), nil
 	}
 	return time.Date(selected.Year(), selected.Month(), selected.Day(), due.Hour(), due.Minute(), due.Second(), 0, location).Add(-time.Minute), nil
+}
+
+type dueDateDeltaAlertsEnvelope struct {
+	ReminderIdentifier      string                  `json:"reminderIdentifier"`
+	AccountIdentifier       string                  `json:"accountIdentifier"`
+	DueDateDeltaAlerts      []dueDateDeltaAlertData `json:"dueDateDeltaAlerts"`
+	MinimumSupportedVersion int                     `json:"minimumSupportedVersion"`
+}
+
+type dueDateDeltaAlertData struct {
+	CreationDate               float64 `json:"creationDate"`
+	DueDateDeltaCount          int     `json:"dueDateDeltaCount"`
+	DueDateDeltaUnit           int     `json:"dueDateDeltaUnit"`
+	Identifier                 string  `json:"identifier"`
+	MinimumSupportedAppVersion int     `json:"minimumSupportedAppVersion"`
+}
+
+// UpdateEarlyReminder replaces or clears the reminder's due-date delta alert.
+func (s *RemindersService) UpdateEarlyReminder(reminderID string, alert *EarlyReminder) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	if alert != nil {
+		if alert.Unit < 0 || alert.Unit > 4 {
+			return fmt.Errorf("early reminder unit must be minutes, hours, days, weeks, or months")
+		}
+		if alert.Count < 1 || alert.Count > 999 {
+			return fmt.Errorf("early reminder count must be between 1 and 999")
+		}
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+	if alert != nil {
+		if _, ok := existing.Fields["DueDate"]; !ok {
+			return fmt.Errorf("early reminders require a due date")
+		}
+	} else if _, ok := existing.Fields["DueDateDeltaAlertsData"]; !ok {
+		return nil
+	}
+
+	accountIdentifier, err := s.earlyReminderAccountIdentifier(existing)
+	if err != nil {
+		return err
+	}
+	envelope := dueDateDeltaAlertsEnvelope{
+		ReminderIdentifier:      strings.TrimPrefix(existing.RecordName, "Reminder/"),
+		AccountIdentifier:       accountIdentifier,
+		DueDateDeltaAlerts:      []dueDateDeltaAlertData{},
+		MinimumSupportedVersion: 20230430,
+	}
+	if alert != nil {
+		envelope.DueDateDeltaAlerts = append(envelope.DueDateDeltaAlerts, dueDateDeltaAlertData{
+			CreationDate:               float64(time.Now().UnixMilli())/1000 - 978307200,
+			DueDateDeltaCount:          -alert.Count,
+			DueDateDeltaUnit:           alert.Unit,
+			Identifier:                 strings.ToUpper(uuid.New().String()),
+			MinimumSupportedAppVersion: 0,
+		})
+	}
+	raw, err := json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("encode early reminder: %w", err)
+	}
+	fields := map[string]FieldValue{
+		"DueDateDeltaAlertsData": {Value: base64.StdEncoding.EncodeToString(raw), Type: "ENCRYPTED_BYTES"},
+	}
+	if err := addResolutionTokenUpdates(existing, fields, "dueDateDeltaAlertsData"); err != nil {
+		return fmt.Errorf("update early reminder resolution token: %w", err)
+	}
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID,
+		Operations: []RecordOperation{{OperationType: OperationUpdate, Record: Record{
+			RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag, Fields: fields,
+		}}},
+	})
+	if err != nil {
+		return fmt.Errorf("update early reminder: %w", err)
+	}
+	if len(response.Records) != 1 {
+		return fmt.Errorf("update early reminder: got %d records, want 1", len(response.Records))
+	}
+	if err := recordError(response.Records[0]); err != nil {
+		return fmt.Errorf("update early reminder: %w", err)
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
+}
+
+func (s *RemindersService) earlyReminderAccountIdentifier(existing Record) (string, error) {
+	records := []Record{existing}
+	for _, record := range s.records {
+		if record.RecordName != existing.RecordName {
+			records = append(records, record)
+		}
+	}
+	for _, record := range records {
+		field, ok := record.Fields["DueDateDeltaAlertsData"]
+		if !ok {
+			continue
+		}
+		encoded, ok := field.Value.(string)
+		if !ok || encoded == "" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			continue
+		}
+		var envelope dueDateDeltaAlertsEnvelope
+		if json.Unmarshal(raw, &envelope) == nil && envelope.AccountIdentifier != "" {
+			return envelope.AccountIdentifier, nil
+		}
+	}
+	return "", fmt.Errorf("cannot determine the Reminders account identifier; create one native early reminder and sync it first")
 }
 
 func numericInt64(value interface{}) (int64, bool) {

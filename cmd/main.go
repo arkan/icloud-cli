@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -199,6 +200,7 @@ type EditCmd struct {
 	RepeatInterval int      `default:"1" help:"Recurrence interval"`
 	RepeatUntil    string   `help:"Last recurrence date (YYYY-MM-DD)"`
 	ClearRepeat    bool     `help:"Remove recurrence"`
+	EarlyReminder  string   `name:"early-reminder" help:"Alert before due date (e.g. 15m, 1h, 2d, 1w, 1mo, or clear)"`
 }
 
 func (c *EditCmd) Run() error {
@@ -282,6 +284,10 @@ func (c *EditCmd) Run() error {
 			recurrence.EndDate = &end
 		}
 	}
+	earlyReminder, clearEarlyReminder, err := parseEarlyReminder(c.EarlyReminder)
+	if err != nil {
+		return err
+	}
 	var location *cloudkit.LocationAlarm
 	if locationRequested {
 		if c.Latitude == nil || c.Longitude == nil {
@@ -305,8 +311,8 @@ func (c *EditCmd) Run() error {
 		value := c.Flagged
 		flagged = &value
 	}
-	if title == nil && description == nil && dueDate == nil && !c.ClearDue && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL && recurrence == nil && !c.ClearRepeat {
-		return fmt.Errorf("no changes specified; use title, due-date, priority, flag, tag, assignment, location, or URL options")
+	if title == nil && description == nil && dueDate == nil && !c.ClearDue && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL && recurrence == nil && !c.ClearRepeat && earlyReminder == nil && !clearEarlyReminder {
+		return fmt.Errorf("no changes specified; use title, due-date, priority, flag, tag, assignment, location, URL, recurrence, or early-reminder options")
 	}
 	if title != nil || description != nil || priority != nil || flagged != nil {
 		changes := cloudkit.ReminderChanges{
@@ -346,6 +352,11 @@ func (c *EditCmd) Run() error {
 			return fmt.Errorf("edit reminder recurrence: %w", err)
 		}
 	}
+	if earlyReminder != nil || clearEarlyReminder {
+		if err := svc.UpdateEarlyReminder(guid, earlyReminder); err != nil {
+			return fmt.Errorf("edit reminder early alert: %w", err)
+		}
+	}
 	color.Green("✓ Update submitted")
 	return nil
 }
@@ -374,6 +385,33 @@ func parseRecurrenceFrequency(value string) (int, error) {
 	default:
 		return 0, fmt.Errorf("invalid recurrence %q; use daily, weekly, monthly, or yearly", value)
 	}
+}
+
+func parseEarlyReminder(value string) (*cloudkit.EarlyReminder, bool, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil, false, nil
+	}
+	if value == "clear" || value == "none" || value == "off" || value == "never" {
+		return nil, true, nil
+	}
+	unitCode := -1
+	number := value
+	for _, suffix := range []struct {
+		text string
+		unit int
+	}{{"mo", 4}, {"m", 0}, {"h", 1}, {"d", 2}, {"w", 3}} {
+		if strings.HasSuffix(value, suffix.text) {
+			unitCode = suffix.unit
+			number = strings.TrimSuffix(value, suffix.text)
+			break
+		}
+	}
+	count, err := strconv.Atoi(number)
+	if err != nil || unitCode < 0 || count < 1 || count > 999 {
+		return nil, false, fmt.Errorf("invalid early reminder %q; use a positive offset such as 15m, 1h, 2d, 1w, or 1mo", value)
+	}
+	return &cloudkit.EarlyReminder{Unit: unitCode, Count: count}, false, nil
 }
 
 // ShareesCmd lists assignment candidates for one shared list.
@@ -589,13 +627,14 @@ func formatDueDate(t time.Time) string {
 
 // AddCmd adds a new reminder
 type AddCmd struct {
-	Title       string `arg:"" help:"Reminder title"`
-	List        string `short:"l" help:"List name or GUID"`
-	Description string `short:"d" help:"Description"`
-	Due         string `help:"Due date (e.g., 'tomorrow 14:00', '2024-01-20')"`
-	TimeZone    string `name:"timezone" help:"IANA timezone for due dates (persisted)"`
-	Priority    string `short:"p" help:"Priority: high, medium, low (default: none)"`
-	Parent      string `help:"Parent reminder ID or unique prefix"`
+	Title         string `arg:"" help:"Reminder title"`
+	List          string `short:"l" help:"List name or GUID"`
+	Description   string `short:"d" help:"Description"`
+	Due           string `help:"Due date (e.g., 'tomorrow 14:00', '2024-01-20')"`
+	TimeZone      string `name:"timezone" help:"IANA timezone for due dates (persisted)"`
+	Priority      string `short:"p" help:"Priority: high, medium, low (default: none)"`
+	Parent        string `help:"Parent reminder ID or unique prefix"`
+	EarlyReminder string `name:"early-reminder" help:"Alert before due date (e.g. 15m, 1h, 2d, 1w, or 1mo)"`
 }
 
 func (c *AddCmd) Run() error {
@@ -650,7 +689,18 @@ func (c *AddCmd) Run() error {
 		}
 	}
 
-	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority, parentGUID); err != nil {
+	earlyReminder, clearEarlyReminder, err := parseEarlyReminder(c.EarlyReminder)
+	if err != nil {
+		return err
+	}
+	if clearEarlyReminder {
+		return fmt.Errorf("--early-reminder clear is only valid when editing a reminder")
+	}
+	if earlyReminder != nil && dueDate == nil {
+		return fmt.Errorf("--early-reminder requires --due when adding a reminder")
+	}
+
+	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority, parentGUID, earlyReminder); err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
 

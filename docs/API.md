@@ -405,6 +405,29 @@ soft deletion using `Deleted = 1` is accepted by the server but does not clear
 the recurrence in the iOS app. These three transitions were verified on a
 native iPhone.
 
+### Add, replace, or remove an Early Reminder
+
+Early Reminders are not relative `AlarmTrigger` children. The reminder stores
+one Base64-encoded JSON envelope in the encrypted-bytes field
+`DueDateDeltaAlertsData`. The envelope contains the reminder UUID, a private
+account UUID, `minimumSupportedVersion = 20230430`, and a
+`dueDateDeltaAlerts` array. Each alert contains an uppercase UUID, a Core Data
+creation timestamp, `minimumSupportedAppVersion = 0`, a unit, and a negative
+count representing an offset before the due date.
+
+The unit mapping is `0` minutes, `1` hours, `2` days, `3` weeks, and `4`
+months. For example, 15 minutes before the due date is encoded as unit `0` and
+count `-15`. Replacement writes exactly one array entry. Removal preserves the
+envelope metadata but writes an empty array. Every transition increments the
+`dueDateDeltaAlertsData` entry in `ResolutionTokenMap` and updates
+`LastModifiedDate`.
+
+The private account UUID is not present on the CloudKit `Account`, `List`, or
+ordinary reminder records observed during research. The client discovers it
+from any existing `DueDateDeltaAlertsData` envelope in the synchronized zone;
+if none exists, it asks the user to create one native Early Reminder first.
+Creation, replacement, and removal were verified in the native iPhone app.
+
 ### Unsupported: When Messaging trigger
 
 The native app stores the selected contact's complete set of email addresses
