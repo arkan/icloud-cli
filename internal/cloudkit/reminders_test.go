@@ -523,6 +523,124 @@ func TestUnassignReminderUsesNativeDelete(t *testing.T) {
 	}
 }
 
+func TestSetURLAttachmentReplacesURLAndPreservesOtherAttachments(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			if lookupCount == 1 {
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AttachmentIDs":{"value":["OLD","IMAGE"],"type":"STRING_LIST"}}}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Attachment/OLD","recordType":"Attachment","recordChangeTag":"old-change","fields":{"Type":{"value":"URL","type":"STRING"}}},{"recordName":"Attachment/IMAGE","recordType":"Attachment","recordChangeTag":"image-change","fields":{"Type":{"value":"Image","type":"STRING"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateURLAttachment("Reminder/R1", "https://example.com/new"); err != nil {
+		t.Fatalf("UpdateURLAttachment: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 3 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	ids := fieldStringList(modify.Operations[0].Record.Fields["AttachmentIDs"].Value)
+	if len(ids) != 2 || ids[0] != "IMAGE" {
+		t.Fatalf("attachment IDs = %#v", ids)
+	}
+	if modify.Operations[1].OperationType != OperationDelete || modify.Operations[1].Record.RecordName != "Attachment/OLD" {
+		t.Errorf("delete operation = %#v", modify.Operations[1])
+	}
+	created := modify.Operations[2]
+	if created.OperationType != OperationCreate || created.Record.RecordName != "Attachment/"+ids[1] {
+		t.Fatalf("create operation = %#v", created)
+	}
+	if created.Record.Parent == nil || created.Record.Parent.RecordName != "Reminder/R1" {
+		t.Errorf("attachment parent = %#v", created.Record.Parent)
+	}
+	if field := created.Record.Fields["URL"]; field.Value != "https://example.com/new" || field.Type != "STRING" || !field.IsEncrypted {
+		t.Errorf("URL field = %#v", field)
+	}
+	if created.Record.Fields["Type"].Value != "URL" || created.Record.Fields["UTI"].Value != "public.url" {
+		t.Errorf("attachment fields = %#v", created.Record.Fields)
+	}
+	if _, ok := modify.Operations[0].Record.Fields["ResolutionTokenMap"]; ok {
+		t.Error("native URL attachment update must not replace ResolutionTokenMap")
+	}
+}
+
+func TestClearURLAttachmentUsesNativeDelete(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	lookupCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			lookupCount++
+			if lookupCount == 1 {
+				_, _ = io.WriteString(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"AttachmentIDs":{"value":["URL1"],"type":"STRING_LIST"}}}]}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"records":[{"recordName":"Attachment/URL1","recordType":"Attachment","recordChangeTag":"url-change","fields":{"Type":{"value":"URL","type":"STRING"}}}]}`)
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			response := RecordsResponse{}
+			for _, operation := range modify.Operations {
+				response.Records = append(response.Records, operation.Record)
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateURLAttachment("Reminder/R1", ""); err != nil {
+		t.Fatalf("UpdateURLAttachment: %v", err)
+	}
+	if !modify.Atomic || len(modify.Operations) != 2 {
+		t.Fatalf("modify request = %#v", modify)
+	}
+	if ids := fieldStringList(modify.Operations[0].Record.Fields["AttachmentIDs"].Value); len(ids) != 0 {
+		t.Errorf("remaining attachment IDs = %#v", ids)
+	}
+	deleted := modify.Operations[1]
+	if deleted.OperationType != OperationDelete || deleted.Record.RecordName != "Attachment/URL1" || deleted.Record.RecordChangeTag != "url-change" {
+		t.Errorf("delete operation = %#v", deleted)
+	}
+}
+
 func TestCreateLocationAlarmUsesAtomicAlarmAndTriggerContract(t *testing.T) {
 	t.Parallel()
 

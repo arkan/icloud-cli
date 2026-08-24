@@ -369,6 +369,51 @@ records are removed with native CloudKit `delete` operations and their current
 change tags. Creation, replacement, and removal are verified in the native
 iPhone app.
 
+### Add, replace, or remove a URL
+
+A URL is an `Attachment` child linked through the reminder's `AttachmentIDs`
+string list. The child uses `Type = URL`, `UTI = public.url`, a validating
+`Reminder` reference, and an encrypted `URL` string. `Deleted` and `Imported`
+are numeric zero values. The child and reminder are created or updated in one
+atomic request.
+
+Replacement and removal look up every linked attachment and delete only those
+whose `Type` is `URL`; images and other attachment types remain linked. The
+parent update also refreshes `LastModifiedDate` but leaves
+`ResolutionTokenMap` unchanged, matching a record captured after editing the
+URL in the native iPhone app. Creation, replacement, and removal are verified
+on iPhone.
+
+### Unsupported: When Messaging trigger
+
+The native app stores the selected contact's complete set of email addresses
+and phone numbers as encrypted JSON in the Reminder field `ContactHandles`.
+Its resolution-token key is `contactHandles`. This field is readable through
+CloudKit, but it is not a sufficient write contract: accepted direct updates
+did not activate the trigger on iPhone, and removing the field did not reliably
+clear the device-local state even with an incremented CRDT token.
+
+EventKit publicly documents only time- and location-based reminder alarms, and
+the tested open-source clients only read this private Messages property. The
+CLI therefore deliberately does not expose mutation flags for it. Supporting
+the feature would require a verified native Contacts/Messages integration or a
+new device-confirmed CloudKit contract.
+
+### Unsupported: image attachments
+
+The native data model links a Reminder to an `Attachment` child through
+`AttachmentIDs`. Image children expose fields such as `Type`, `Reminder`,
+`FileAsset`, `FileName`, `FileSize`, `Width`, `Height`, and `UTI`. Reading this
+shape is not enough to create one safely: CloudKit assets require a separate
+three-stage upload flow before the returned asset receipt can be written into
+the child record.
+
+The only device-verified open-source implementation found creates images
+through Apple's private ReminderKit framework on macOS. Other CloudKit clients
+only map attachment records for reading, and no cross-platform writer with a
+native-device-verified record contract was found. The CLI therefore does not
+expose image attachment mutation.
+
 ### Delete a reminder
 
 Use the native operation and current change tag:

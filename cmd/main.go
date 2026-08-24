@@ -190,6 +190,8 @@ type EditCmd struct {
 	Radius        float64  `default:"100" help:"Location alarm radius in meters"`
 	Proximity     string   `default:"arriving" help:"Location alarm proximity: arriving or leaving"`
 	ClearLocation bool     `help:"Remove the location alarm"`
+	URL           string   `help:"Set or replace the native URL attachment"`
+	ClearURL      bool     `help:"Remove the native URL attachment"`
 }
 
 func (c *EditCmd) Run() error {
@@ -235,6 +237,9 @@ func (c *EditCmd) Run() error {
 	if locationRequested && c.ClearLocation {
 		return fmt.Errorf("location options and --clear-location are mutually exclusive")
 	}
+	if c.URL != "" && c.ClearURL {
+		return fmt.Errorf("--url and --clear-url are mutually exclusive")
+	}
 	var location *cloudkit.LocationAlarm
 	if locationRequested {
 		if c.Latitude == nil || c.Longitude == nil {
@@ -258,8 +263,8 @@ func (c *EditCmd) Run() error {
 		value := c.Flagged
 		flagged = &value
 	}
-	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation {
-		return fmt.Errorf("no changes specified; use --title, --description, --due, --priority, --flagged, --no-flagged, --tag, --remove-tag, --assign, --unassign, location options, or --clear-location")
+	if title == nil && description == nil && dueDate == nil && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL {
+		return fmt.Errorf("no changes specified; use title, due-date, priority, flag, tag, assignment, location, or URL options")
 	}
 	if title != nil || description != nil || dueDate != nil || priority != nil || flagged != nil {
 		changes := cloudkit.ReminderChanges{
@@ -282,6 +287,11 @@ func (c *EditCmd) Run() error {
 	if location != nil || c.ClearLocation {
 		if err := svc.UpdateLocationAlarm(guid, location); err != nil {
 			return fmt.Errorf("edit reminder location: %w", err)
+		}
+	}
+	if c.URL != "" || c.ClearURL {
+		if err := svc.UpdateURLAttachment(guid, c.URL); err != nil {
+			return fmt.Errorf("edit reminder URL: %w", err)
 		}
 	}
 	color.Green("✓ Update submitted")

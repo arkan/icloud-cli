@@ -64,6 +64,8 @@ icloud reminders edit ABC12345 --unassign
 icloud reminders edit ABC12345 --location-title "Office" --address "1 Infinite Loop" \
   --latitude 37.3318 --longitude -122.0312 --radius 150 --proximity arriving
 icloud reminders edit ABC12345 --clear-location
+icloud reminders edit ABC12345 --url "https://example.com"
+icloud reminders edit ABC12345 --clear-url
 icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
@@ -132,7 +134,17 @@ and renders correctly. A dedicated test account is recommended.
   iPhone app. Coordinates are required; `--proximity` accepts `arriving` or
   `leaving`. iOS chooses a radius in its own UI but does not expose a radius
   control; the CLI accepts an explicit radius in meters.
-- Attachments and time-based alarm management are not yet exposed.
+- Native URL attachment creation, replacement, and removal are verified in the
+  iPhone app. Setting a URL preserves attachments of other types.
+- Image attachments are not supported. They require a multi-stage CloudKit
+  asset upload followed by an undocumented `Attachment` record mutation. The
+  only verified writer found uses Apple's private ReminderKit on macOS, so no
+  cross-platform contract has been validated on an Apple device.
+- Time-based alarm management is not yet exposed.
+- The “When Messaging” trigger is not supported. CloudKit exposes its encrypted
+  `ContactHandles` field, but direct writes and removals did not materialize
+  reliably in the native iPhone app; the state also depends on local
+  Contacts/Messages resolution that is unavailable to this cross-platform CLI.
 - Marking a reminder complete is experimental. CloudKit accepted the numeric
   `Completed` and `CompletionDate` fields but reconciled them back on one live
   account.

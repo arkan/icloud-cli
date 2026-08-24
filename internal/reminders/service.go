@@ -190,6 +190,14 @@ func (s *Service) UpdateLocationAlarm(reminderGUID string, location *cloudkit.Lo
 	return nil
 }
 
+// UpdateURLAttachment replaces or clears the reminder's native URL attachment.
+func (s *Service) UpdateURLAttachment(reminderGUID, rawURL string) error {
+	if err := s.cloudkitSvc.UpdateURLAttachment(reminderGUID, rawURL); err != nil {
+		return fmt.Errorf("update URL attachment: %w", err)
+	}
+	return nil
+}
+
 // Complete submits a completion mutation via CloudKit.
 func (s *Service) Complete(reminderGUID string) error {
 	if err := s.cloudkitSvc.CompleteReminder(reminderGUID); err != nil {

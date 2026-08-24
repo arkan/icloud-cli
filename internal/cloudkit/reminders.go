@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1318,6 +1319,101 @@ func (s *RemindersService) locationAlarmDeletes(alarmIDs []string) ([]string, []
 		)
 	}
 	return remaining, deletes, nil
+}
+
+// UpdateURLAttachment replaces or clears URL attachments while preserving
+// image and other attachment types linked to the reminder.
+func (s *RemindersService) UpdateURLAttachment(reminderID, rawURL string) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL != "" {
+		parsed, err := url.ParseRequestURI(rawURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return fmt.Errorf("URL must be an absolute HTTP or HTTPS URL")
+		}
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+
+	attachmentIDs := fieldStringList(existing.Fields["AttachmentIDs"].Value)
+	remainingIDs := make([]string, 0, len(attachmentIDs)+1)
+	operations := make([]RecordOperation, 0, len(attachmentIDs)+2)
+	if len(attachmentIDs) > 0 {
+		names := make([]string, 0, len(attachmentIDs))
+		for _, id := range attachmentIDs {
+			names = append(names, "Attachment/"+id)
+		}
+		response, err := s.client.LookupRecords(RemindersContainer, RemindersEnv, RemindersDB, s.zoneID, names)
+		if err != nil {
+			return fmt.Errorf("lookup reminder attachments: %w", err)
+		}
+		if len(response.Records) != len(names) {
+			return fmt.Errorf("lookup reminder attachments: got %d records, want %d", len(response.Records), len(names))
+		}
+		for _, attachment := range response.Records {
+			if err := recordError(attachment); err != nil {
+				return fmt.Errorf("lookup reminder attachment: %w", err)
+			}
+			if attachment.Fields["Type"].Value == "URL" {
+				operations = append(operations, RecordOperation{OperationType: OperationDelete, Record: Record{
+					RecordName: attachment.RecordName, RecordType: "Attachment", RecordChangeTag: attachment.RecordChangeTag,
+				}})
+				continue
+			}
+			remainingIDs = append(remainingIDs, strings.TrimPrefix(attachment.RecordName, "Attachment/"))
+		}
+	}
+	if rawURL == "" && len(operations) == 0 {
+		return nil
+	}
+
+	if rawURL != "" {
+		id := strings.ToUpper(uuid.New().String())
+		remainingIDs = append(remainingIDs, id)
+		operations = append(operations, RecordOperation{OperationType: OperationCreate, Record: Record{
+			RecordName: "Attachment/" + id,
+			RecordType: "Attachment",
+			Parent:     &RecordReference{RecordName: reminderID},
+			Fields: map[string]FieldValue{
+				"Deleted":  {Value: int64(0), Type: "NUMBER_INT64"},
+				"Imported": {Value: int64(0), Type: "NUMBER_INT64"},
+				"Reminder": {Value: RecordReference{RecordName: reminderID, Action: "VALIDATE"}, Type: "REFERENCE"},
+				"Type":     {Value: "URL", Type: "STRING"},
+				"URL":      {Value: rawURL, Type: "STRING", IsEncrypted: true},
+				"UTI":      {Value: "public.url", Type: "STRING"},
+			},
+		}})
+	}
+
+	parent := RecordOperation{OperationType: OperationUpdate, Record: Record{
+		RecordName: reminderID, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag,
+		Fields: map[string]FieldValue{
+			"AttachmentIDs":    {Value: remainingIDs, Type: "STRING_LIST"},
+			"LastModifiedDate": {Value: time.Now().UnixMilli(), Type: "TIMESTAMP"},
+		},
+	}}
+	operations = append([]RecordOperation{parent}, operations...)
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID, Operations: operations, Atomic: true,
+	})
+	if err != nil {
+		return fmt.Errorf("update URL attachment: %w", err)
+	}
+	if len(response.Records) != len(operations) {
+		return fmt.Errorf("update URL attachment: got %d records, want %d", len(response.Records), len(operations))
+	}
+	for _, record := range response.Records {
+		if err := recordError(record); err != nil {
+			return fmt.Errorf("update URL attachment: %w", err)
+		}
+	}
+	s.records[reminderID] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
 }
 
 // UpdateTags atomically updates HashtagIDs and its linked Hashtag records.
