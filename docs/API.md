@@ -219,13 +219,23 @@ First use `records/lookup` to obtain the current `recordChangeTag`, then send an
 }
 ```
 
-Priority and due-date updates are live-tested. Title and notes replacements are
-experimental: the server accepts a newly encoded CRDT snapshot but may later
-reconcile the old text back into the record.
+Priority, due-date, title, and notes updates are live-tested. Text updates must
+edit the existing CRDT document rather than submit a new snapshot. The writer
+uses a stable client replica, tombstones the previous live substring, preserves
+the existing operation history, and advances its logical timestamp beyond all
+other observed replicas. A fresh concurrent snapshot can otherwise be ignored
+or concatenated with the native value.
 
-Completion is also experimental: send numeric `Completed` and
-`CompletionDate`, but be aware that live tests observed CloudKit reconciling
-both fields back to the incomplete state.
+Completion is live-tested with `Completed` as `NUMBER_INT64` and
+`CompletionDate` and `LastModifiedDate` as `TIMESTAMP`. The same update advances
+the `completed`, `completionDate`, and `lastModifiedDate` resolution tokens.
+
+Urgent alarms use a three-step asset write: request an upload target, upload the
+JSON account-state envelope, then update `UrgentPresentationAlarmsAsData` as an
+`ASSETID` alongside the encrypted string checksum in
+`UrgentPresentationAlarmsChecksum`. The corresponding resolution-token key is
+`urgentPresentationAlarmsChecksum`. The account's private person identifier is
+discovered from existing synchronized records rather than fabricated.
 
 ### Add or remove a native tag
 
@@ -273,6 +283,10 @@ a native tag by the iPhone app.
 Removal uses the same atomic reminder update and a native CloudKit `delete`
 operation for the Hashtag record. A soft `Deleted = 1` update remains visible
 in the iPhone app and can prevent deletion of the parent reminder.
+
+Global tag renaming is intentionally out of scope and will not be supported.
+Clients should remove the old tag from affected reminders and add the
+replacement tag instead.
 
 ### Assign a shared reminder
 
@@ -428,7 +442,7 @@ from any existing `DueDateDeltaAlertsData` envelope in the synchronized zone;
 if none exists, it asks the user to create one native Early Reminder first.
 Creation, replacement, and removal were verified in the native iPhone app.
 
-### Unsupported: When Messaging trigger
+### Permanently unsupported: When Messaging trigger
 
 The native app stores the selected contact's complete set of email addresses
 and phone numbers as encrypted JSON in the Reminder field `ContactHandles`.
@@ -439,11 +453,10 @@ clear the device-local state even with an incremented CRDT token.
 
 EventKit publicly documents only time- and location-based reminder alarms, and
 the tested open-source clients only read this private Messages property. The
-CLI therefore deliberately does not expose mutation flags for it. Supporting
-the feature would require a verified native Contacts/Messages integration or a
-new device-confirmed CloudKit contract.
+CLI deliberately does not expose mutation flags for it. This property is
+permanently out of scope and will not be supported.
 
-### Unsupported: image attachments
+### Permanently unsupported: image attachments
 
 The native data model links a Reminder to an `Attachment` child through
 `AttachmentIDs`. Image children expose fields such as `Type`, `Reminder`,
@@ -455,8 +468,8 @@ the child record.
 The only device-verified open-source implementation found creates images
 through Apple's private ReminderKit framework on macOS. Other CloudKit clients
 only map attachment records for reading, and no cross-platform writer with a
-native-device-verified record contract was found. The CLI therefore does not
-expose image attachment mutation.
+native-device-verified record contract was found. Image attachment mutation is
+permanently out of scope and will not be supported.
 
 ### Delete a reminder
 

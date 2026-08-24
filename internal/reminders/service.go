@@ -117,7 +117,7 @@ func (s *Service) GetReminders(listGUID string, includeCompleted ...bool) ([]Par
 }
 
 // Add creates a new reminder via CloudKit
-func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.DueDateChange, priority int, parentGUID string, earlyReminder *cloudkit.EarlyReminder) error {
+func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.DueDateChange, priority int, parentGUID string, earlyReminder *cloudkit.EarlyReminder, urgent bool) error {
 	// If no list specified, use the first available list
 	if listGUID == "" && parentGUID == "" {
 		lists, err := s.cloudkitSvc.GetLists()
@@ -144,6 +144,11 @@ func (s *Service) Add(title, description, listGUID string, dueDate *cloudkit.Due
 			return fmt.Errorf("set reminder early alert: %w", err)
 		}
 	}
+	if urgent {
+		if err := s.cloudkitSvc.UpdateUrgentReminder(created.ID, true); err != nil {
+			return fmt.Errorf("set reminder Urgent alarm: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -168,6 +173,14 @@ func (s *Service) UpdateRecurrence(reminderGUID string, recurrence *cloudkit.Rec
 func (s *Service) UpdateEarlyReminder(reminderGUID string, alert *cloudkit.EarlyReminder) error {
 	if err := s.cloudkitSvc.UpdateEarlyReminder(reminderGUID, alert); err != nil {
 		return fmt.Errorf("update early reminder: %w", err)
+	}
+	return nil
+}
+
+// UpdateUrgent enables or disables the reminder's Urgent alarm.
+func (s *Service) UpdateUrgent(reminderGUID string, enabled bool) error {
+	if err := s.cloudkitSvc.UpdateUrgentReminder(reminderGUID, enabled); err != nil {
+		return fmt.Errorf("update Urgent alarm: %w", err)
 	}
 	return nil
 }

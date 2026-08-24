@@ -1,8 +1,11 @@
 package cloudkit
 
 import (
+	"bytes"
 	"compress/gzip"
+	"crypto/sha512"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +19,7 @@ import (
 
 	"github.com/arkan/icloud-cli/internal/api"
 	"github.com/arkan/icloud-cli/internal/config"
+	"github.com/google/uuid"
 )
 
 func TestAddReminderUsesRemindersCloudKitContract(t *testing.T) {
@@ -180,7 +184,7 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
 		case strings.Contains(r.URL.Path, "/records/lookup"):
 			lookupCount++
-			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"ABC-123","recordType":"Reminder","recordChangeTag":"change-%d","fields":{"ResolutionTokenMap":{"value":"{\"map\":{\"flagged\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"lastModifiedDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"}}}"}}}]}`, lookupCount+6)
+			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"ABC-123","recordType":"Reminder","recordChangeTag":"change-%d","fields":{"ResolutionTokenMap":{"value":"{\"map\":{\"titleDocument\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"notesDocument\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"flagged\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"completed\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"completionDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"lastModifiedDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"}}}"}}}]}`, lookupCount+6)
 		case strings.Contains(r.URL.Path, "/records/modify"):
 			var request ModifyRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -201,8 +205,9 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 	service := newRemindersService(client, "")
 	priority := 5
 	title := "Experimental edit"
+	notes := "Experimental notes"
 	flagged := true
-	if err := service.UpdateReminder("ABC-123", ReminderChanges{Title: &title, Priority: &priority, Flagged: &flagged}); err != nil {
+	if err := service.UpdateReminder("ABC-123", ReminderChanges{Title: &title, Notes: &notes, Priority: &priority, Flagged: &flagged}); err != nil {
 		t.Fatalf("UpdateReminder: %v", err)
 	}
 	if err := service.CompleteReminder("ABC-123"); err != nil {
@@ -223,12 +228,15 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 		t.Errorf("priority field = %#v", edit.Record.Fields["Priority"])
 	}
 	assertCRDTDocumentContains(t, edit.Record.Fields["TitleDocument"].Value.(string), title)
+	assertCRDTDocumentContains(t, edit.Record.Fields["NotesDocument"].Value.(string), notes)
 	if edit.Record.Fields["Flagged"].Value != float64(1) || edit.Record.Fields["Flagged"].Type != "NUMBER_INT64" {
 		t.Errorf("flagged field = %#v", edit.Record.Fields["Flagged"])
 	}
-	tokenJSON, _ := edit.Record.Fields["ResolutionTokenMap"].Value.(string)
-	if !strings.Contains(tokenJSON, `"counter":3`) || !strings.Contains(tokenJSON, `"replicaID":"device"`) {
-		t.Errorf("resolution token map = %s", tokenJSON)
+	tokens := resolutionTokens(t, edit.Record.Fields)
+	for _, key := range []string{"titleDocument", "notesDocument", "flagged", "lastModifiedDate"} {
+		if counter := tokens[key]["counter"]; counter != float64(3) {
+			t.Errorf("resolution token %q counter = %#v, want 3", key, counter)
+		}
 	}
 	if edit.Record.Fields["LastModifiedDate"].Type != "TIMESTAMP" {
 		t.Errorf("last modified field = %#v", edit.Record.Fields["LastModifiedDate"])
@@ -236,6 +244,15 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 	complete := operations[1]
 	if complete.Record.Fields["Completed"].Value != float64(1) {
 		t.Errorf("complete fields = %#v", complete.Record.Fields)
+	}
+	completeTokens := resolutionTokens(t, complete.Record.Fields)
+	for _, key := range []string{"completed", "completionDate", "lastModifiedDate"} {
+		if counter := completeTokens[key]["counter"]; counter != float64(3) {
+			t.Errorf("completion token %q counter = %#v, want 3", key, counter)
+		}
+	}
+	if complete.Record.Fields["LastModifiedDate"].Type != "TIMESTAMP" {
+		t.Errorf("completion last modified field = %#v", complete.Record.Fields["LastModifiedDate"])
 	}
 	deleteOp := operations[2]
 	if deleteOp.OperationType != "delete" || deleteOp.Record.RecordName != "ABC-123" || deleteOp.Record.RecordChangeTag != "change-9" {
@@ -247,6 +264,263 @@ func TestReminderMutationsUseExactRecordNameAndChangeTag(t *testing.T) {
 	if lookupCount != 3 {
 		t.Errorf("lookup count = %d, want a fresh change tag for every mutation", lookupCount)
 	}
+}
+
+func TestReplaceDocumentTextTombstonesOldContent(t *testing.T) {
+	existing, err := encodeTitleDocument("old text")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replicaID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	replaced, err := replaceDocumentText(existing, "Café replacement 🛒", replicaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacedRaw := decodeCRDTTestDocument(t, replaced)
+	if bytes.Contains(replacedRaw, []byte("old text")) {
+		t.Fatalf("replacement retained old text: %x", replacedRaw)
+	}
+	if !bytes.Contains(replacedRaw, []byte("Café replacement 🛒")) {
+		t.Fatalf("replacement is missing new text: %x", replacedRaw)
+	}
+	wrapper, ok := protobufBytesField(replacedRaw, 2)
+	if !ok {
+		t.Fatal("missing document wrapper")
+	}
+	note, ok := protobufBytesField(wrapper, 3)
+	if !ok {
+		t.Fatal("missing CRDT string")
+	}
+	fields, err := decodeProtobufFields(note)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var substrings []protobufField
+	metadataEntries := 0
+	var newReplicaTimestamp uint64
+	for _, field := range fields {
+		if field.number == 3 {
+			substrings = append(substrings, field)
+		}
+		if field.number == 4 {
+			metadata, err := decodeProtobufFields(field.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range metadata {
+				if entry.number == 1 {
+					metadataEntries++
+					entryFields, err := decodeProtobufFields(entry.payload)
+					if err != nil {
+						t.Fatal(err)
+					}
+					entryUUID, _ := protobufBytesTestField(entryFields, 1)
+					isCLIReplica := bytes.Equal(entryUUID, replicaID[:])
+					clockIndex := 0
+					for _, entryField := range entryFields {
+						if entryField.number == 2 {
+							clockIndex++
+							if clockIndex == 2 {
+								clock, err := decodeProtobufFields(entryField.payload)
+								if err != nil {
+									t.Fatal(err)
+								}
+								if isCLIReplica {
+									newReplicaTimestamp = protobufVarintTestField(clock, 1)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if len(substrings) != 4 {
+		t.Fatalf("substring count = %d, want 4", len(substrings))
+	}
+	oldSubstring, err := decodeProtobufFields(substrings[2].payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !protobufBoolField(oldSubstring, 4) {
+		t.Fatal("old live substring was not tombstoned")
+	}
+	tombstone, ok := protobufBytesTestField(oldSubstring, 3)
+	if !ok {
+		t.Fatal("old live substring has no tombstone timestamp")
+	}
+	tombstoneFields, err := decodeProtobufFields(tombstone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replica := protobufVarintTestField(tombstoneFields, 1); replica != 2 {
+		t.Fatalf("tombstone author replica = %d, want 2", replica)
+	}
+	oldCharID, ok := protobufBytesTestField(oldSubstring, 1)
+	if !ok {
+		t.Fatal("old substring has no character ID")
+	}
+	oldCharFields, err := decodeProtobufFields(oldCharID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replica := protobufVarintTestField(oldCharFields, 1); replica != 1 {
+		t.Fatalf("existing character replica = %d, want 1", replica)
+	}
+	newSubstring, err := decodeProtobufFields(substrings[1].payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if length := protobufVarintTestField(newSubstring, 2); length != 19 {
+		t.Fatalf("new substring UTF-16 length = %d, want 19", length)
+	}
+	newCharID, ok := protobufBytesTestField(newSubstring, 1)
+	if !ok {
+		t.Fatal("new substring has no character ID")
+	}
+	newCharFields, err := decodeProtobufFields(newCharID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replica, clock := protobufVarintTestField(newCharFields, 1), protobufVarintTestField(newCharFields, 2); replica != 2 || clock != 7 {
+		t.Fatalf("new character ID = (%d,%d), want (2,7)", replica, clock)
+	}
+	if metadataEntries != 2 {
+		t.Fatalf("metadata replica count = %d, want 2", metadataEntries)
+	}
+	if newReplicaTimestamp != 3 {
+		t.Fatalf("new replica timestamp = %d, want 3", newReplicaTimestamp)
+	}
+
+	// Simulate another device publishing at the same logical timestamp. The
+	// next CLI edit must advance beyond it or Reminders may keep that device's
+	// value, as happens when title and notes replicas race during sync.
+	replaced = setDocumentReplicaTimestamp(t, replaced, 0, 3)
+	second, err := replaceDocumentText(replaced, "next", replicaID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRaw := decodeCRDTTestDocument(t, second)
+	secondWrapper, _ := protobufBytesField(secondRaw, 2)
+	secondNote, _ := protobufBytesField(secondWrapper, 3)
+	secondFields, err := decodeProtobufFields(secondNote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondSubstrings []protobufField
+	secondReplicaCount := 0
+	for _, field := range secondFields {
+		if field.number == 3 {
+			secondSubstrings = append(secondSubstrings, field)
+		}
+		if field.number == 4 {
+			secondMetadata, _ := decodeProtobufFields(field.payload)
+			for _, entry := range secondMetadata {
+				if entry.number == 1 {
+					secondReplicaCount++
+				}
+			}
+		}
+	}
+	if secondReplicaCount != 2 {
+		t.Fatalf("second edit replica count = %d, want 2", secondReplicaCount)
+	}
+	latest, err := decodeProtobufFields(secondSubstrings[1].payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latestCharID, _ := protobufBytesTestField(latest, 1)
+	latestCharFields, _ := decodeProtobufFields(latestCharID)
+	if replica, clock := protobufVarintTestField(latestCharFields, 1), protobufVarintTestField(latestCharFields, 2); replica != 2 || clock != 26 {
+		t.Fatalf("second edit character ID = (%d,%d), want (2,26)", replica, clock)
+	}
+	previousLive, err := decodeProtobufFields(secondSubstrings[2].payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousTimestamp, _ := protobufBytesTestField(previousLive, 3)
+	previousTimestampFields, _ := decodeProtobufFields(previousTimestamp)
+	if clock := protobufVarintTestField(previousTimestampFields, 2); clock != 4 {
+		t.Fatalf("second edit tombstone timestamp = %d, want 4", clock)
+	}
+}
+
+func setDocumentReplicaTimestamp(t *testing.T, encoded string, replicaIndex int, value uint64) string {
+	t.Helper()
+	raw := decodeCRDTTestDocument(t, encoded)
+	rewritten, replaced, err := rewriteBytesField(raw, 2, func(wrapper []byte) ([]byte, error) {
+		return rewriteRequiredBytesField(wrapper, 3, func(note []byte) ([]byte, error) {
+			fields, err := decodeProtobufFields(note)
+			if err != nil {
+				return nil, err
+			}
+			for index := range fields {
+				if fields[index].number != 4 || fields[index].wire != 2 {
+					continue
+				}
+				metadata, err := decodeProtobufFields(fields[index].payload)
+				if err != nil {
+					return nil, err
+				}
+				seen := 0
+				for metadataIndex := range metadata {
+					if metadata[metadataIndex].number != 1 || metadata[metadataIndex].wire != 2 {
+						continue
+					}
+					if seen != replicaIndex {
+						seen++
+						continue
+					}
+					entry, err := decodeProtobufFields(metadata[metadataIndex].payload)
+					if err != nil {
+						return nil, err
+					}
+					clockIndex := 0
+					for entryIndex := range entry {
+						if entry[entryIndex].number != 2 || entry[entryIndex].wire != 2 {
+							continue
+						}
+						clockIndex++
+						if clockIndex == 2 {
+							entry[entryIndex].payload = encodeField(1, 0, value)
+						}
+					}
+					metadata[metadataIndex].payload = encodeProtobufFields(entry)
+					fields[index].payload = encodeProtobufFields(metadata)
+					return encodeProtobufFields(fields), nil
+				}
+			}
+			return nil, fmt.Errorf("replica %d not found", replicaIndex)
+		})
+	})
+	if err != nil || !replaced {
+		t.Fatalf("set replica timestamp: replaced=%v err=%v", replaced, err)
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(rewritten); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(compressed.Bytes())
+}
+
+func resolutionTokens(t *testing.T, fields map[string]FieldValue) map[string]map[string]interface{} {
+	t.Helper()
+	var envelope struct {
+		Map map[string]map[string]interface{} `json:"map"`
+	}
+	value, ok := fields["ResolutionTokenMap"].Value.(string)
+	if !ok {
+		t.Fatalf("ResolutionTokenMap = %#v", fields["ResolutionTokenMap"])
+	}
+	if err := json.Unmarshal([]byte(value), &envelope); err != nil {
+		t.Fatalf("decode ResolutionTokenMap: %v", err)
+	}
+	return envelope.Map
 }
 
 func TestCreateTagUsesAtomicLinkedChildContract(t *testing.T) {
@@ -1090,6 +1364,73 @@ func TestUpdateEarlyReminderWritesNativeEnvelopeAndToken(t *testing.T) {
 	}
 }
 
+func TestUpdateUrgentReminderUploadsNativeAccountState(t *testing.T) {
+	t.Parallel()
+
+	var modify ModifyRequest
+	var uploaded []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/zones/list"):
+			_, _ = io.WriteString(w, `{"zones":[{"zoneID":{"zoneName":"Reminders","ownerRecordName":"owner-123"}}]}`)
+		case strings.Contains(r.URL.Path, "/records/lookup"):
+			_, _ = fmt.Fprintf(w, `{"records":[{"recordName":"Reminder/R1","recordType":"Reminder","recordChangeTag":"rem-change","fields":{"UrgentPresentationAlarmsAsData":{"value":{"downloadURL":%q},"type":"ASSETID"},"ResolutionTokenMap":{"value":"{\"map\":{\"urgentPresentationAlarmsChecksum\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"},\"lastModifiedDate\":{\"counter\":2,\"modificationTime\":100,\"replicaID\":\"device\"}}}"}}}]}`, serverURL(r)+"/baseline")
+		case r.URL.Path == "/baseline":
+			_, _ = io.WriteString(w, `{"minimumSupportedVersion":20251103,"account":[{"isEnabled":false,"modifiedOn":100,"personID":"PERSON"}]}`)
+		case strings.Contains(r.URL.Path, "/assets/upload"):
+			_ = json.NewEncoder(w).Encode(AssetUploadResponse{Tokens: []AssetUploadToken{{URL: serverURL(r) + "/asset-data"}}})
+		case r.URL.Path == "/asset-data":
+			var err error
+			uploaded, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read uploaded asset: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"singleFile": AssetValue{
+				WrappingKey: "key", FileChecksum: "file", Receipt: "receipt", ReferenceChecksum: "reference", Size: int64(len(uploaded)),
+			}})
+		case strings.Contains(r.URL.Path, "/records/modify"):
+			if err := json.NewDecoder(r.Body).Decode(&modify); err != nil {
+				t.Errorf("decode modify request: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(RecordsResponse{Records: []Record{modify.Operations[0].Record}})
+		default:
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(api.NewClient(&config.Session{Webservices: map[string]string{"ckdatabasews": server.URL}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newRemindersService(client, "")
+	if err := service.UpdateUrgentReminder("Reminder/R1", true); err != nil {
+		t.Fatalf("UpdateUrgentReminder: %v", err)
+	}
+	var envelope urgentPresentationAlarmsEnvelope
+	if err := json.Unmarshal(uploaded, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.MinimumSupportedVersion != 20251103 || len(envelope.Account) != 1 || !envelope.Account[0].IsEnabled || envelope.Account[0].PersonID != "PERSON" {
+		t.Fatalf("urgent envelope = %#v", envelope)
+	}
+	fields := modify.Operations[0].Record.Fields
+	asset, ok := fields["UrgentPresentationAlarmsAsData"].Value.(map[string]interface{})
+	if !ok || asset["receipt"] != "receipt" {
+		t.Fatalf("urgent asset field = %#v", fields["UrgentPresentationAlarmsAsData"])
+	}
+	digest := sha512.Sum512(uploaded)
+	if checksum := fields["UrgentPresentationAlarmsChecksum"]; checksum.Value != hex.EncodeToString(digest[:]) || checksum.Type != "STRING" || !checksum.IsEncrypted {
+		t.Fatalf("urgent checksum = %#v", checksum)
+	}
+	tokens := resolutionTokens(t, fields)
+	for _, key := range []string{"urgentPresentationAlarmsChecksum", "lastModifiedDate"} {
+		if counter := tokens[key]["counter"]; counter != float64(3) {
+			t.Errorf("urgent token %q counter = %#v, want 3", key, counter)
+		}
+	}
+}
+
 func TestClearLocationAlarmPreservesOtherAlarmTypes(t *testing.T) {
 	t.Parallel()
 
@@ -1289,4 +1630,78 @@ func assertCRDTDocumentContains(t *testing.T, encoded, title string) {
 	if strings.Count(string(decompressed), "\x1a") < 3 {
 		t.Errorf("CRDT document does not contain three operations: %x", decompressed)
 	}
+}
+
+func decodeCRDTTestDocument(t *testing.T, encoded string) []byte {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decompressed, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return decompressed
+}
+
+func crdtTestHistory(t *testing.T, document []byte) []byte {
+	t.Helper()
+	wrapper, ok := protobufBytesField(document, 2)
+	if !ok {
+		t.Fatal("missing document wrapper")
+	}
+	note, ok := protobufBytesField(wrapper, 3)
+	if !ok {
+		t.Fatal("missing note")
+	}
+	var history []byte
+	for offset := 0; offset < len(note); {
+		start := offset
+		tag, tagBytes := decodeVarint(note[offset:])
+		if tagBytes == 0 {
+			t.Fatal("invalid note tag")
+		}
+		offset += tagBytes
+		if int(tag&7) != 2 {
+			t.Fatalf("unexpected note wire type %d", tag&7)
+		}
+		length, lengthBytes := decodeVarint(note[offset:])
+		if lengthBytes == 0 {
+			t.Fatal("invalid note length")
+		}
+		offset += lengthBytes + int(length)
+		if offset > len(note) {
+			t.Fatal("note field exceeds document")
+		}
+		if fieldNumber := int(tag >> 3); fieldNumber == 3 || fieldNumber == 4 {
+			history = append(history, note[start:offset]...)
+		}
+	}
+	return history
+}
+
+func protobufVarintTestField(fields []protobufField, number int) uint64 {
+	for _, field := range fields {
+		if field.number == number && field.wire == 0 {
+			return field.varint
+		}
+	}
+	return 0
+}
+
+func protobufBytesTestField(fields []protobufField, number int) ([]byte, bool) {
+	for _, field := range fields {
+		if field.number == number && field.wire == 2 {
+			return field.payload, true
+		}
+	}
+	return nil, false
 }

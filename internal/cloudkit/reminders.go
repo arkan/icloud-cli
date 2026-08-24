@@ -3,7 +3,9 @@ package cloudkit
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha512"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -33,6 +36,7 @@ type RemindersService struct {
 	synced    bool
 	cachePath string
 	cacheRead bool
+	replicaID uuid.UUID
 }
 
 // ReminderList represents a reminder list
@@ -110,15 +114,21 @@ func NewRemindersService(client *Client) *RemindersService {
 	if home, err := os.UserHomeDir(); err == nil {
 		cachePath = filepath.Join(home, ".icloud-cli", "cloudkit-cache.json")
 	}
-	return newRemindersService(client, cachePath)
+	replicaID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(client.apiClient.Session().ClientID+":reminders-crdt"))
+	return newRemindersServiceWithReplica(client, cachePath, replicaID)
 }
 
 func newRemindersService(client *Client, cachePath string) *RemindersService {
+	return newRemindersServiceWithReplica(client, cachePath, uuid.NewSHA1(uuid.NameSpaceOID, []byte("icloud-cli-test-replica")))
+}
+
+func newRemindersServiceWithReplica(client *Client, cachePath string, replicaID uuid.UUID) *RemindersService {
 	return &RemindersService{
 		client:    client,
 		zoneID:    ZoneID{ZoneName: RemindersZone},
 		records:   make(map[string]Record),
 		cachePath: cachePath,
+		replicaID: replicaID,
 	}
 }
 
@@ -630,6 +640,429 @@ func encodeTitleDocument(title string) (string, error) {
 	return base64.StdEncoding.EncodeToString(compressed.Bytes()), nil
 }
 
+// replaceDocumentText keeps the document's CRDT identity and operation history.
+// Replacing an existing document with a freshly encoded snapshot creates a
+// concurrent branch, which Reminders resolves by concatenating both strings.
+func replaceDocumentText(encoded, text string, replicaUUID uuid.UUID) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode document: %w", err)
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return "", fmt.Errorf("open document compressor: %w", err)
+	}
+	message, err := io.ReadAll(reader)
+	if err != nil {
+		return "", fmt.Errorf("read document: %w", err)
+	}
+	if err := reader.Close(); err != nil {
+		return "", fmt.Errorf("close document compressor: %w", err)
+	}
+
+	message, replaced, err := rewriteBytesField(message, 2, func(document []byte) ([]byte, error) {
+		return rewriteRequiredBytesField(document, 3, func(note []byte) ([]byte, error) {
+			return replaceCRDTString(note, text, replicaUUID)
+		})
+	})
+	if err != nil {
+		return "", fmt.Errorf("replace document text: %w", err)
+	}
+	if !replaced {
+		return "", fmt.Errorf("replace document text: document wrapper is missing")
+	}
+
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(message); err != nil {
+		return "", fmt.Errorf("compress document: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("close document compressor: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(compressed.Bytes()), nil
+}
+
+type protobufField struct {
+	number  int
+	wire    int
+	varint  uint64
+	payload []byte
+}
+
+func replaceCRDTString(message []byte, text string, replicaUUID uuid.UUID) ([]byte, error) {
+	fields, err := decodeProtobufFields(message)
+	if err != nil {
+		return nil, err
+	}
+	textIndex := -1
+	metadataIndex := -1
+	var substringIndexes []int
+	var attributeIndexes []int
+	for index, field := range fields {
+		switch {
+		case field.number == 2 && field.wire == 2 && textIndex == -1:
+			textIndex = index
+		case field.number == 3 && field.wire == 2:
+			substringIndexes = append(substringIndexes, index)
+		case field.number == 4 && field.wire == 2 && metadataIndex == -1:
+			metadataIndex = index
+		case field.number == 5 && field.wire == 2:
+			attributeIndexes = append(attributeIndexes, index)
+		}
+	}
+	if textIndex == -1 || metadataIndex == -1 || len(substringIndexes) < 2 {
+		return nil, fmt.Errorf("incomplete CRDT string document")
+	}
+	var attributeTemplate []protobufField
+	if len(attributeIndexes) > 0 {
+		attributeTemplate, _ = decodeProtobufFields(fields[attributeIndexes[len(attributeIndexes)-1]].payload)
+	}
+
+	metadata, err := decodeProtobufFields(fields[metadataIndex].payload)
+	if err != nil {
+		return nil, fmt.Errorf("decode vector timestamp: %w", err)
+	}
+	var maximumCharClock uint64
+	var maximumTimestamp uint64
+	for _, fieldIndex := range substringIndexes {
+		substring, decodeErr := decodeProtobufFields(fields[fieldIndex].payload)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode CRDT substring clock: %w", decodeErr)
+		}
+		charID, _ := protobufBytesValue(substring, 1)
+		charFields, _ := decodeProtobufFields(charID)
+		replica := protobufVarintValue(charFields, 1)
+		clock := protobufVarintValue(charFields, 2)
+		substringLength := protobufVarintValue(substring, 2)
+		isSentinel := replica == 0 && clock == 0xffffffff
+		if !isSentinel {
+			end := clock
+			if substringLength > 0 {
+				end += substringLength - 1
+			}
+			if end > maximumCharClock {
+				maximumCharClock = end
+			}
+		}
+		if !isSentinel {
+			timestamp, _ := protobufBytesValue(substring, 3)
+			timestampFields, _ := decodeProtobufFields(timestamp)
+			if value := protobufVarintValue(timestampFields, 2); value > maximumTimestamp {
+				maximumTimestamp = value
+			}
+		}
+	}
+	length := uint64(len(utf16.Encode([]rune(text))))
+	newCharClock := maximumCharClock
+	tombstoneTimestamp := maximumTimestamp + 1
+	replicaSlot := -1
+	var replicaTimestamp uint64
+	var maximumOtherReplicaTimestamp uint64
+	for index, field := range metadata {
+		if field.number != 1 || field.wire != 2 {
+			continue
+		}
+		entry, decodeErr := decodeProtobufFields(field.payload)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode replica entry: %w", decodeErr)
+		}
+		uuidBytes, ok := protobufBytesValue(entry, 1)
+		isReplica := ok && bytes.Equal(uuidBytes, replicaUUID[:])
+		clockIndex := 0
+		for _, entryField := range entry {
+			if entryField.number != 2 || entryField.wire != 2 {
+				continue
+			}
+			clockIndex++
+			clock, clockErr := decodeProtobufFields(entryField.payload)
+			if clockErr != nil {
+				return nil, fmt.Errorf("decode replica clock: %w", clockErr)
+			}
+			if isReplica && clockIndex == 1 {
+				newCharClock = protobufVarintValue(clock, 1)
+			} else if clockIndex == 2 {
+				value := protobufVarintValue(clock, 1)
+				if isReplica {
+					replicaTimestamp = value
+				} else if value > maximumOtherReplicaTimestamp {
+					maximumOtherReplicaTimestamp = value
+				}
+			}
+		}
+		if isReplica {
+			replicaSlot = index
+		}
+	}
+	if replicaSlot >= 0 {
+		tombstoneTimestamp = replicaTimestamp
+		if tombstoneTimestamp <= maximumOtherReplicaTimestamp {
+			tombstoneTimestamp = maximumOtherReplicaTimestamp + 1
+		}
+	} else if tombstoneTimestamp <= maximumOtherReplicaTimestamp {
+		tombstoneTimestamp = maximumOtherReplicaTimestamp + 1
+	}
+	replicaID := uint64(replicaSlot + 1)
+	if replicaSlot == -1 {
+		replicaID = uint64(len(metadata) + 1)
+	}
+	clockEntry := encodeField(1, 2, replicaUUID[:])
+	clockEntry = append(clockEntry, encodeField(2, 2, encodeField(1, 0, newCharClock+length))...)
+	clockEntry = append(clockEntry, encodeField(2, 2, encodeField(1, 0, tombstoneTimestamp+1))...)
+	if replicaSlot == -1 {
+		metadata = append(metadata, protobufField{number: 1, wire: 2, payload: clockEntry})
+	} else {
+		metadata[replicaSlot].payload = clockEntry
+	}
+	fields[metadataIndex].payload = encodeProtobufFields(metadata)
+
+	for arrayIndex, fieldIndex := range substringIndexes {
+		substring, err := decodeProtobufFields(fields[fieldIndex].payload)
+		if err != nil {
+			return nil, fmt.Errorf("decode CRDT substring %d: %w", arrayIndex, err)
+		}
+		if arrayIndex > 0 {
+			for index := range substring {
+				if substring[index].number == 5 && substring[index].wire == 0 {
+					substring[index].varint++
+				}
+			}
+		} else {
+			firstChild := true
+			for index := range substring {
+				if substring[index].number != 5 || substring[index].wire != 0 {
+					continue
+				}
+				if firstChild {
+					firstChild = false
+					continue
+				}
+				substring[index].varint++
+			}
+		}
+		if arrayIndex > 0 && arrayIndex < len(substringIndexes)-1 && !protobufBoolField(substring, 4) {
+			substring = setProtobufVarint(substring, 4, 1)
+			timestamp := encodeField(1, 0, replicaID)
+			timestamp = append(timestamp, encodeField(2, 0, tombstoneTimestamp)...)
+			substring = setProtobufBytes(substring, 3, timestamp)
+		}
+		fields[fieldIndex].payload = encodeProtobufFields(substring)
+	}
+
+	newSubstring := encodeField(1, 2, append(encodeField(1, 0, replicaID), encodeField(2, 0, newCharClock)...))
+	newSubstring = append(newSubstring, encodeField(2, 0, length)...)
+	newSubstring = append(newSubstring, encodeField(3, 2, append(encodeField(1, 0, replicaID), encodeField(2, 0, uint64(0))...))...)
+	newSubstring = append(newSubstring, encodeField(5, 0, uint64(2))...)
+	docStartIndex := substringIndexes[0]
+	fields = append(fields[:docStartIndex+1], append([]protobufField{{number: 3, wire: 2, payload: newSubstring}}, fields[docStartIndex+1:]...)...)
+
+	fields[textIndex].payload = []byte(text)
+	attributeTemplate = setProtobufVarint(attributeTemplate, 1, length)
+	var withoutAttributes []protobufField
+	for _, field := range fields {
+		if field.number != 5 || field.wire != 2 {
+			withoutAttributes = append(withoutAttributes, field)
+		}
+	}
+	withoutAttributes = append(withoutAttributes, protobufField{number: 5, wire: 2, payload: encodeProtobufFields(attributeTemplate)})
+	return encodeProtobufFields(withoutAttributes), nil
+}
+
+func decodeProtobufFields(message []byte) ([]protobufField, error) {
+	var fields []protobufField
+	for offset := 0; offset < len(message); {
+		tag, tagBytes := decodeVarint(message[offset:])
+		if tagBytes == 0 {
+			return nil, fmt.Errorf("invalid protobuf tag at byte %d", offset)
+		}
+		offset += tagBytes
+		field := protobufField{number: int(tag >> 3), wire: int(tag & 7)}
+		switch field.wire {
+		case 0:
+			value, valueBytes := decodeVarint(message[offset:])
+			if valueBytes == 0 {
+				return nil, fmt.Errorf("invalid protobuf varint at byte %d", offset)
+			}
+			field.varint = value
+			offset += valueBytes
+		case 2:
+			length, lengthBytes := decodeVarint(message[offset:])
+			if lengthBytes == 0 {
+				return nil, fmt.Errorf("invalid protobuf length at byte %d", offset)
+			}
+			offset += lengthBytes
+			end := offset + int(length)
+			if end < offset || end > len(message) {
+				return nil, fmt.Errorf("invalid protobuf field %d length", field.number)
+			}
+			field.payload = append([]byte(nil), message[offset:end]...)
+			offset = end
+		default:
+			return nil, fmt.Errorf("unsupported protobuf wire type %d", field.wire)
+		}
+		fields = append(fields, field)
+	}
+	return fields, nil
+}
+
+func encodeProtobufFields(fields []protobufField) []byte {
+	var message []byte
+	for _, field := range fields {
+		message = append(message, encodeVarint(uint64(field.number<<3|field.wire))...)
+		if field.wire == 0 {
+			message = append(message, encodeVarint(field.varint)...)
+		} else {
+			message = append(message, encodeVarint(uint64(len(field.payload)))...)
+			message = append(message, field.payload...)
+		}
+	}
+	return message
+}
+
+func protobufBoolField(fields []protobufField, number int) bool {
+	for _, field := range fields {
+		if field.number == number && field.wire == 0 {
+			return field.varint != 0
+		}
+	}
+	return false
+}
+
+func setProtobufVarint(fields []protobufField, number int, value uint64) []protobufField {
+	for index := range fields {
+		if fields[index].number == number && fields[index].wire == 0 {
+			fields[index].varint = value
+			return fields
+		}
+	}
+	return append(fields, protobufField{number: number, wire: 0, varint: value})
+}
+
+func setProtobufBytes(fields []protobufField, number int, value []byte) []protobufField {
+	for index := range fields {
+		if fields[index].number == number && fields[index].wire == 2 {
+			fields[index].payload = value
+			return fields
+		}
+	}
+	return append(fields, protobufField{number: number, wire: 2, payload: value})
+}
+
+func protobufVarintValue(fields []protobufField, number int) uint64 {
+	for _, field := range fields {
+		if field.number == number && field.wire == 0 {
+			return field.varint
+		}
+	}
+	return 0
+}
+
+func protobufBytesValue(fields []protobufField, number int) ([]byte, bool) {
+	for _, field := range fields {
+		if field.number == number && field.wire == 2 {
+			return field.payload, true
+		}
+	}
+	return nil, false
+}
+
+func rewriteRequiredBytesField(message []byte, number int, rewrite func([]byte) ([]byte, error)) ([]byte, error) {
+	updated, replaced, err := rewriteBytesField(message, number, rewrite)
+	if err != nil {
+		return nil, err
+	}
+	if !replaced {
+		return nil, fmt.Errorf("protobuf field %d is missing", number)
+	}
+	return updated, nil
+}
+
+func replaceBytesFieldValue(message []byte, number int, value []byte) ([]byte, bool, error) {
+	return rewriteBytesField(message, number, func([]byte) ([]byte, error) { return value, nil })
+}
+
+func rewriteBytesField(message []byte, number int, rewrite func([]byte) ([]byte, error)) ([]byte, bool, error) {
+	var result []byte
+	replaced := false
+	for offset := 0; offset < len(message); {
+		start := offset
+		tag, tagBytes := decodeVarint(message[offset:])
+		if tagBytes == 0 {
+			return nil, false, fmt.Errorf("invalid protobuf tag at byte %d", offset)
+		}
+		offset += tagBytes
+		fieldNumber, wireType := int(tag>>3), int(tag&7)
+		switch wireType {
+		case 0:
+			_, valueBytes := decodeVarint(message[offset:])
+			if valueBytes == 0 {
+				return nil, false, fmt.Errorf("invalid protobuf varint at byte %d", offset)
+			}
+			offset += valueBytes
+			result = append(result, message[start:offset]...)
+		case 2:
+			length, lengthBytes := decodeVarint(message[offset:])
+			if lengthBytes == 0 {
+				return nil, false, fmt.Errorf("invalid protobuf length at byte %d", offset)
+			}
+			offset += lengthBytes
+			end := offset + int(length)
+			if end < offset || end > len(message) {
+				return nil, false, fmt.Errorf("invalid protobuf field %d length", fieldNumber)
+			}
+			if fieldNumber == number && !replaced {
+				value, err := rewrite(message[offset:end])
+				if err != nil {
+					return nil, false, err
+				}
+				result = append(result, message[start:start+tagBytes]...)
+				result = append(result, encodeVarint(uint64(len(value)))...)
+				result = append(result, value...)
+				replaced = true
+			} else {
+				result = append(result, message[start:end]...)
+			}
+			offset = end
+		default:
+			return nil, false, fmt.Errorf("unsupported protobuf wire type %d", wireType)
+		}
+	}
+	return result, replaced, nil
+}
+
+func replaceVarintFieldValue(message []byte, number int, value uint64) ([]byte, error) {
+	var result []byte
+	replaced := false
+	for offset := 0; offset < len(message); {
+		start := offset
+		tag, tagBytes := decodeVarint(message[offset:])
+		if tagBytes == 0 {
+			return nil, fmt.Errorf("invalid protobuf tag at byte %d", offset)
+		}
+		offset += tagBytes
+		fieldNumber, wireType := int(tag>>3), int(tag&7)
+		if wireType != 0 {
+			return nil, fmt.Errorf("unexpected protobuf wire type %d in attributes", wireType)
+		}
+		_, valueBytes := decodeVarint(message[offset:])
+		if valueBytes == 0 {
+			return nil, fmt.Errorf("invalid protobuf varint at byte %d", offset)
+		}
+		offset += valueBytes
+		if fieldNumber == number && !replaced {
+			result = append(result, message[start:start+tagBytes]...)
+			result = append(result, encodeVarint(value)...)
+			replaced = true
+		} else {
+			result = append(result, message[start:offset]...)
+		}
+	}
+	if !replaced {
+		return nil, fmt.Errorf("protobuf field %d is missing", number)
+	}
+	return result, nil
+}
+
 // extractReadableText tries to extract readable text from protobuf-encoded data
 func extractReadableText(s string) string {
 	data := []byte(s)
@@ -855,19 +1288,22 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 		return err
 	}
 	fields := make(map[string]FieldValue)
+	var resolutionKeys []string
 	if changes.Title != nil {
-		encoded, err := encodeTitleDocument(*changes.Title)
+		encoded, err := s.replaceReminderDocument(existing, "TitleDocument", *changes.Title)
 		if err != nil {
 			return fmt.Errorf("encode title: %w", err)
 		}
 		fields["TitleDocument"] = FieldValue{Value: encoded}
+		resolutionKeys = append(resolutionKeys, "titleDocument")
 	}
 	if changes.Notes != nil {
-		encoded, err := encodeTitleDocument(*changes.Notes)
+		encoded, err := s.replaceReminderDocument(existing, "NotesDocument", *changes.Notes)
 		if err != nil {
 			return fmt.Errorf("encode notes: %w", err)
 		}
 		fields["NotesDocument"] = FieldValue{Value: encoded}
+		resolutionKeys = append(resolutionKeys, "notesDocument")
 	}
 	if changes.Priority != nil {
 		fields["Priority"] = FieldValue{Value: *changes.Priority}
@@ -878,12 +1314,15 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 			value = 1
 		}
 		fields["Flagged"] = FieldValue{Value: value, Type: "NUMBER_INT64"}
-		if err := addResolutionTokenUpdate(existing, fields, "flagged"); err != nil {
-			return fmt.Errorf("update flag resolution token: %w", err)
-		}
+		resolutionKeys = append(resolutionKeys, "flagged")
 	}
 	if len(fields) == 0 {
 		return fmt.Errorf("no reminder changes specified")
+	}
+	if len(resolutionKeys) > 0 {
+		if err := addResolutionTokenUpdates(existing, fields, resolutionKeys...); err != nil {
+			return fmt.Errorf("update reminder resolution tokens: %w", err)
+		}
 	}
 
 	request := ModifyRequest{
@@ -911,6 +1350,18 @@ func (s *RemindersService) UpdateReminder(reminderID string, changes ReminderCha
 	s.records[reminderID] = mergeRecord(existing, response.Records[0])
 	s.persistCache()
 	return nil
+}
+
+func (s *RemindersService) replaceReminderDocument(record Record, fieldName, text string) (string, error) {
+	field, ok := record.Fields[fieldName]
+	if !ok {
+		return encodeTitleDocument(text)
+	}
+	encoded, ok := field.Value.(string)
+	if !ok || encoded == "" {
+		return encodeTitleDocument(text)
+	}
+	return replaceDocumentText(encoded, text, s.replicaID)
 }
 
 func addResolutionTokenUpdate(record Record, fields map[string]FieldValue, key string) error {
@@ -1789,6 +2240,124 @@ type dueDateDeltaAlertData struct {
 	MinimumSupportedAppVersion int     `json:"minimumSupportedAppVersion"`
 }
 
+type urgentPresentationAlarmsEnvelope struct {
+	MinimumSupportedVersion int                              `json:"minimumSupportedVersion"`
+	Account                 []urgentPresentationAlarmAccount `json:"account"`
+}
+
+type urgentPresentationAlarmAccount struct {
+	IsEnabled  bool    `json:"isEnabled"`
+	ModifiedOn float64 `json:"modifiedOn"`
+	PersonID   string  `json:"personID"`
+}
+
+// UpdateUrgentReminder enables or disables the alarm that bypasses Focus and
+// silent mode when the reminder becomes due.
+func (s *RemindersService) UpdateUrgentReminder(reminderID string, enabled bool) error {
+	if err := s.ensureZone(); err != nil {
+		return err
+	}
+	existing, err := s.lookupReminder(reminderID)
+	if err != nil {
+		return err
+	}
+	envelope, err := s.urgentPresentationEnvelope(existing)
+	if err != nil {
+		return err
+	}
+	modifiedOn := float64(time.Now().UnixMilli())/1000 - 978307200
+	for index := range envelope.Account {
+		envelope.Account[index].IsEnabled = enabled
+		envelope.Account[index].ModifiedOn = modifiedOn
+	}
+	if envelope.MinimumSupportedVersion == 0 {
+		envelope.MinimumSupportedVersion = 20251103
+	}
+	content, err := json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("encode urgent reminder state: %w", err)
+	}
+	asset, err := s.client.UploadAsset(
+		RemindersContainer, RemindersEnv, RemindersDB, s.zoneID,
+		existing.RecordName, "Reminder", "UrgentPresentationAlarmsAsData", content,
+	)
+	if err != nil {
+		return fmt.Errorf("upload urgent reminder state: %w", err)
+	}
+	digest := sha512.Sum512(content)
+	fields := map[string]FieldValue{
+		"UrgentPresentationAlarmsAsData": {Value: asset, Type: "ASSETID"},
+		"UrgentPresentationAlarmsChecksum": {
+			Value: hex.EncodeToString(digest[:]), Type: "STRING", IsEncrypted: true,
+		},
+	}
+	if err := addResolutionTokenUpdates(existing, fields, "urgentPresentationAlarmsChecksum"); err != nil {
+		return fmt.Errorf("update urgent reminder resolution token: %w", err)
+	}
+	response, err := s.client.ModifyRecords(RemindersContainer, RemindersEnv, RemindersDB, ModifyRequest{
+		ZoneID: s.zoneID,
+		Operations: []RecordOperation{{OperationType: OperationUpdate, Record: Record{
+			RecordName: existing.RecordName, RecordType: "Reminder", RecordChangeTag: existing.RecordChangeTag, Fields: fields,
+		}}},
+	})
+	if err != nil {
+		return fmt.Errorf("update urgent reminder: %w", err)
+	}
+	if len(response.Records) != 1 {
+		return fmt.Errorf("update urgent reminder: got %d records, want 1", len(response.Records))
+	}
+	if err := recordError(response.Records[0]); err != nil {
+		return fmt.Errorf("update urgent reminder: %w", err)
+	}
+	s.records[existing.RecordName] = mergeRecord(existing, response.Records[0])
+	s.persistCache()
+	return nil
+}
+
+func (s *RemindersService) urgentPresentationEnvelope(existing Record) (urgentPresentationAlarmsEnvelope, error) {
+	if envelope, ok := s.decodeUrgentPresentationEnvelope(existing); ok {
+		return envelope, nil
+	}
+	for _, record := range s.records {
+		if envelope, ok := s.decodeUrgentPresentationEnvelope(record); ok {
+			return envelope, nil
+		}
+	}
+	if err := s.Sync(true); err != nil {
+		return urgentPresentationAlarmsEnvelope{}, fmt.Errorf("find urgent reminder account state: %w", err)
+	}
+	for _, record := range s.records {
+		if envelope, ok := s.decodeUrgentPresentationEnvelope(record); ok {
+			return envelope, nil
+		}
+	}
+	return urgentPresentationAlarmsEnvelope{}, fmt.Errorf("cannot determine the Urgent alarm person identifier; enable Urgent once in Reminders and sync it first")
+}
+
+func (s *RemindersService) decodeUrgentPresentationEnvelope(record Record) (urgentPresentationAlarmsEnvelope, bool) {
+	field, ok := record.Fields["UrgentPresentationAlarmsAsData"]
+	if !ok {
+		return urgentPresentationAlarmsEnvelope{}, false
+	}
+	value, ok := field.Value.(map[string]interface{})
+	if !ok {
+		return urgentPresentationAlarmsEnvelope{}, false
+	}
+	downloadURL, _ := value["downloadURL"].(string)
+	if downloadURL == "" {
+		return urgentPresentationAlarmsEnvelope{}, false
+	}
+	content, err := s.client.DownloadAsset(downloadURL)
+	if err != nil {
+		return urgentPresentationAlarmsEnvelope{}, false
+	}
+	var envelope urgentPresentationAlarmsEnvelope
+	if json.Unmarshal(content, &envelope) != nil || len(envelope.Account) == 0 || envelope.Account[0].PersonID == "" {
+		return urgentPresentationAlarmsEnvelope{}, false
+	}
+	return envelope, true
+}
+
 // UpdateEarlyReminder replaces or clears the reminder's due-date delta alert.
 func (s *RemindersService) UpdateEarlyReminder(reminderID string, alert *EarlyReminder) error {
 	if err := s.ensureZone(); err != nil {
@@ -2104,6 +2673,13 @@ func (s *RemindersService) CompleteReminder(reminderID string) error {
 	if err != nil {
 		return err
 	}
+	fields := map[string]FieldValue{
+		"Completed":      {Value: int64(1), Type: "NUMBER_INT64"},
+		"CompletionDate": {Value: time.Now().UnixMilli(), Type: "TIMESTAMP"},
+	}
+	if err := addResolutionTokenUpdates(existing, fields, "completed", "completionDate"); err != nil {
+		return fmt.Errorf("update completion resolution tokens: %w", err)
+	}
 	request := ModifyRequest{
 		ZoneID: s.zoneID,
 		Operations: []RecordOperation{{
@@ -2112,10 +2688,7 @@ func (s *RemindersService) CompleteReminder(reminderID string) error {
 				RecordName:      reminderID,
 				RecordType:      "Reminder",
 				RecordChangeTag: existing.RecordChangeTag,
-				Fields: map[string]FieldValue{
-					"Completed":      {Value: int64(1)},
-					"CompletionDate": {Value: time.Now().UnixMilli()},
-				},
+				Fields:          fields,
 			},
 		}},
 	}

@@ -147,6 +147,30 @@ type RecordsResponse struct {
 	ContinuationMarker string   `json:"continuationMarker,omitempty"`
 }
 
+type AssetUploadRequest struct {
+	ZoneID ZoneID             `json:"zoneID"`
+	Tokens []AssetUploadToken `json:"tokens"`
+}
+
+type AssetUploadResponse struct {
+	Tokens []AssetUploadToken `json:"tokens"`
+}
+
+type AssetUploadToken struct {
+	RecordName string `json:"recordName"`
+	RecordType string `json:"recordType,omitempty"`
+	FieldName  string `json:"fieldName"`
+	URL        string `json:"url,omitempty"`
+}
+
+type AssetValue struct {
+	WrappingKey       string `json:"wrappingKey"`
+	FileChecksum      string `json:"fileChecksum"`
+	Receipt           string `json:"receipt"`
+	ReferenceChecksum string `json:"referenceChecksum"`
+	Size              int64  `json:"size"`
+}
+
 // LookupRequest is the request body for records/lookup
 type LookupRequest struct {
 	Records []RecordRef `json:"records"`

@@ -18,8 +18,9 @@ CloudKit web service used by iCloud.com.
 - Create subtasks, manage native tags, set or clear flags, assign shared reminders, and manage location alarms
 - Set or clear due dates and native daily, weekly, monthly, or yearly recurrence
 - Add, replace, or clear native Early Reminders relative to a due date
-- Edit titles, notes, due dates, and priorities (text updates are experimental)
-- Mark reminders complete (experimental)
+- Enable or disable native Urgent alarms
+- Edit titles, notes, due dates, and priorities
+- Mark reminders complete
 - Delete reminders
 - CloudKit delta synchronization with optimistic locking
 
@@ -53,7 +54,7 @@ icloud reminders ls "Shopping"
 icloud reminders add "Buy milk" -l "Shopping"
 icloud reminders add "Call mom" --due "tomorrow 14:00" --priority high
 icloud reminders add "Buy detergent" --parent ABC12345
-icloud reminders edit ABC12345 --title "Buy oat milk" --description "Experimental"
+icloud reminders edit ABC12345 --title "Buy oat milk" --description "Get two cartons"
 icloud reminders edit ABC12345 --due "2026-09-01" --priority medium
 icloud reminders edit ABC12345 --flagged
 icloud reminders edit ABC12345 --no-flagged
@@ -74,6 +75,8 @@ icloud reminders edit ABC12345 --repeat monthly --repeat-until 2026-12-31
 icloud reminders edit ABC12345 --clear-repeat
 icloud reminders edit ABC12345 --early-reminder 15m
 icloud reminders edit ABC12345 --early-reminder clear
+icloud reminders edit ABC12345 --urgent
+icloud reminders edit ABC12345 --no-urgent
 icloud reminders done ABC12345
 icloud reminders rm ABC12345
 ```
@@ -84,9 +87,12 @@ by `icloud reminders ls`.
 ## How writes work
 
 Reminders titles and notes are not plain strings. They are CRDT documents
-encoded as protobuf, gzip, and Base64. Creation now supplies the full document
+encoded as protobuf, gzip, and Base64. Creation supplies the full document
 structure, including operations, positions, replica metadata, Unicode character
-counts, and a document UUID.
+counts, and a document UUID. Updates preserve the document history, tombstone
+the previous live substring, and advance a stable client replica beyond every
+observed replica timestamp. This prevents concurrent branches from being
+concatenated or an Apple device's older value from winning reconciliation.
 
 CloudKit operations also use:
 
@@ -130,14 +136,14 @@ and renders correctly. A dedicated test account is recommended.
 - The CloudKit API and Reminders CRDT format are undocumented.
 - Live behavior may differ with Advanced Data Protection, shared lists, or
   future Apple server changes.
-- Editing a title or notes is experimental. CloudKit accepts the replacement
-  CRDT document, but live tests on one account reconciled it back to the
-  previous text. The command is exposed for accounts where that private API
-  behavior differs. Priority and due-date updates are verified.
+- Title and notes replacement is verified across repeated CLI edits and native
+  Apple edits. It depends on an undocumented CRDT format and may require future
+  maintenance if Apple changes that format.
 - Due-date creation, replacement, and removal are verified. Timed due dates use
   the configured IANA timezone; date-only values remain all-day reminders.
-- Tag creation and removal are verified. Renaming tags is not exposed; remove
-  the old tag and add the replacement instead.
+- Tag creation and removal are verified. Global tag renaming is intentionally
+  out of scope and will not be supported; remove the old tag and add the
+  replacement instead.
 - Shared-list assignment and unassignment are verified for accepted participants.
 - Location alarm creation, replacement, and removal are verified in the native
   iPhone app. Coordinates are required; `--proximity` accepts `arriving` or
@@ -149,7 +155,8 @@ and renders correctly. A dedicated test account is recommended.
   removal are verified in the native iPhone app. Creation must write the child
   rule before the parent relation; modification preserves the existing native
   rule identity; removal uses a native CloudKit delete rather than `Deleted=1`.
-- Image attachments are not supported. They require a multi-stage CloudKit
+- Image attachments are permanently out of scope and will not be supported.
+  They require a multi-stage CloudKit
   asset upload followed by an undocumented `Attachment` record mutation. The
   only verified writer found uses Apple's private ReminderKit on macOS, so no
   cross-platform contract has been validated on an Apple device.
@@ -159,13 +166,18 @@ and renders correctly. A dedicated test account is recommended.
   (`mo`). Apple stores a private account UUID only inside this metadata; if an
   account has never synchronized a native Early Reminder, create one once in
   Reminders before the CLI can discover that identifier.
-- The “When Messaging” trigger is not supported. CloudKit exposes its encrypted
+- Urgent alarm creation and removal are verified in the native Reminders apps.
+  The private CloudKit contract stores the per-account state in an uploaded
+  asset. If the account has never synchronized an Urgent alarm, enable it once
+  in Reminders so the CLI can discover the private person identifier.
+- The “When Messaging” trigger is permanently out of scope and will not be
+  supported. CloudKit exposes its encrypted
   `ContactHandles` field, but direct writes and removals did not materialize
   reliably in the native iPhone app; the state also depends on local
   Contacts/Messages resolution that is unavailable to this cross-platform CLI.
-- Marking a reminder complete is experimental. CloudKit accepted the numeric
-  `Completed` and `CompletionDate` fields but reconciled them back on one live
-  account.
+- Marking a reminder complete is verified in the native Reminders apps. It uses
+  the native integer completion state, completion timestamp, last-modified
+  timestamp, and matching resolution tokens.
 - The local CloudKit cache contains reminder metadata and is specific to the
   authenticated zone owner. Remove it to force a full resynchronization.
 

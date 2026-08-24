@@ -48,3 +48,23 @@ func TestParseEarlyReminderRejectsInvalidOffset(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+func TestUrgentChange(t *testing.T) {
+	t.Parallel()
+
+	enabled, err := urgentChange(true, false)
+	if err != nil || enabled == nil || !*enabled {
+		t.Fatalf("urgentChange(true, false) = %#v, %v", enabled, err)
+	}
+	disabled, err := urgentChange(false, true)
+	if err != nil || disabled == nil || *disabled {
+		t.Fatalf("urgentChange(false, true) = %#v, %v", disabled, err)
+	}
+	unchanged, err := urgentChange(false, false)
+	if err != nil || unchanged != nil {
+		t.Fatalf("urgentChange(false, false) = %#v, %v", unchanged, err)
+	}
+	if _, err := urgentChange(true, true); err == nil {
+		t.Fatal("urgentChange(true, true) should reject conflicting flags")
+	}
+}

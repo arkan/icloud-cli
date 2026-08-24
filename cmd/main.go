@@ -168,15 +168,15 @@ type RemindersCmd struct {
 	Sharees ShareesCmd `cmd:"" help:"List accepted participants of a shared list"`
 	Add     AddCmd     `cmd:"" help:"Add a new reminder"`
 	Edit    EditCmd    `cmd:"" help:"Edit a reminder"`
-	Done    DoneCmd    `cmd:"" help:"Mark a reminder as done (experimental)"`
+	Done    DoneCmd    `cmd:"" help:"Mark a reminder as done"`
 	Rm      RmCmd      `cmd:"" help:"Delete a reminder"`
 }
 
 // EditCmd updates selected reminder fields.
 type EditCmd struct {
 	ID             string   `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
-	Title          string   `help:"Replacement title (experimental)"`
-	Description    string   `short:"d" help:"Replacement description (experimental)"`
+	Title          string   `help:"Replacement title"`
+	Description    string   `short:"d" help:"Replacement description"`
 	Due            string   `help:"Replacement due date"`
 	ClearDue       bool     `help:"Remove the due date and its date alarm"`
 	TimeZone       string   `name:"timezone" help:"IANA timezone for due dates (persisted)"`
@@ -201,6 +201,8 @@ type EditCmd struct {
 	RepeatUntil    string   `help:"Last recurrence date (YYYY-MM-DD)"`
 	ClearRepeat    bool     `help:"Remove recurrence"`
 	EarlyReminder  string   `name:"early-reminder" help:"Alert before due date (e.g. 15m, 1h, 2d, 1w, 1mo, or clear)"`
+	Urgent         bool     `help:"Enable the Urgent alarm"`
+	NoUrgent       bool     `name:"no-urgent" help:"Disable the Urgent alarm"`
 }
 
 func (c *EditCmd) Run() error {
@@ -288,6 +290,10 @@ func (c *EditCmd) Run() error {
 	if err != nil {
 		return err
 	}
+	urgent, err := urgentChange(c.Urgent, c.NoUrgent)
+	if err != nil {
+		return err
+	}
 	var location *cloudkit.LocationAlarm
 	if locationRequested {
 		if c.Latitude == nil || c.Longitude == nil {
@@ -311,8 +317,8 @@ func (c *EditCmd) Run() error {
 		value := c.Flagged
 		flagged = &value
 	}
-	if title == nil && description == nil && dueDate == nil && !c.ClearDue && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL && recurrence == nil && !c.ClearRepeat && earlyReminder == nil && !clearEarlyReminder {
-		return fmt.Errorf("no changes specified; use title, due-date, priority, flag, tag, assignment, location, URL, recurrence, or early-reminder options")
+	if title == nil && description == nil && dueDate == nil && !c.ClearDue && priority == nil && flagged == nil && len(c.Tags) == 0 && len(c.RemoveTags) == 0 && c.Assign == "" && !c.Unassign && location == nil && !c.ClearLocation && c.URL == "" && !c.ClearURL && recurrence == nil && !c.ClearRepeat && earlyReminder == nil && !clearEarlyReminder && urgent == nil {
+		return fmt.Errorf("no changes specified; use title, due-date, priority, flag, tag, assignment, location, URL, recurrence, early-reminder, or urgent options")
 	}
 	if title != nil || description != nil || priority != nil || flagged != nil {
 		changes := cloudkit.ReminderChanges{
@@ -355,6 +361,11 @@ func (c *EditCmd) Run() error {
 	if earlyReminder != nil || clearEarlyReminder {
 		if err := svc.UpdateEarlyReminder(guid, earlyReminder); err != nil {
 			return fmt.Errorf("edit reminder early alert: %w", err)
+		}
+	}
+	if urgent != nil {
+		if err := svc.UpdateUrgent(guid, *urgent); err != nil {
+			return fmt.Errorf("edit reminder Urgent alarm: %w", err)
 		}
 	}
 	color.Green("✓ Update submitted")
@@ -412,6 +423,17 @@ func parseEarlyReminder(value string) (*cloudkit.EarlyReminder, bool, error) {
 		return nil, false, fmt.Errorf("invalid early reminder %q; use a positive offset such as 15m, 1h, 2d, 1w, or 1mo", value)
 	}
 	return &cloudkit.EarlyReminder{Unit: unitCode, Count: count}, false, nil
+}
+
+func urgentChange(enable, disable bool) (*bool, error) {
+	if enable && disable {
+		return nil, fmt.Errorf("--urgent and --no-urgent are mutually exclusive")
+	}
+	if !enable && !disable {
+		return nil, nil
+	}
+	value := enable
+	return &value, nil
 }
 
 // ShareesCmd lists assignment candidates for one shared list.
@@ -635,6 +657,7 @@ type AddCmd struct {
 	Priority      string `short:"p" help:"Priority: high, medium, low (default: none)"`
 	Parent        string `help:"Parent reminder ID or unique prefix"`
 	EarlyReminder string `name:"early-reminder" help:"Alert before due date (e.g. 15m, 1h, 2d, 1w, or 1mo)"`
+	Urgent        bool   `help:"Enable the Urgent alarm"`
 }
 
 func (c *AddCmd) Run() error {
@@ -700,7 +723,7 @@ func (c *AddCmd) Run() error {
 		return fmt.Errorf("--early-reminder requires --due when adding a reminder")
 	}
 
-	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority, parentGUID, earlyReminder); err != nil {
+	if err := svc.Add(c.Title, c.Description, listGUID, dueDate, priority, parentGUID, earlyReminder, c.Urgent); err != nil {
 		return fmt.Errorf("add reminder: %w", err)
 	}
 
@@ -783,7 +806,7 @@ func configuredTimeZone(override string) (*time.Location, string, error) {
 	return location, zone, nil
 }
 
-// DoneCmd submits an experimental completion mutation.
+// DoneCmd marks a reminder as complete.
 type DoneCmd struct {
 	ID string `arg:"" help:"Reminder ID (first 8 chars or full GUID)"`
 }
