@@ -11,3 +11,4 @@ test_*.py
 
 # Local config
 .claude/
+/bin
