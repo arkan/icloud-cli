@@ -38,6 +38,24 @@ cd icloud-cli
 go build -o icloud ./cmd/
 ```
 
+### Install the agent skill
+
+Install the repository's `icloud-cli` skill in the current project with the
+[`skills` CLI](https://www.skills.sh/docs/cli):
+
+```bash
+npx skills add arkan/icloud-cli
+```
+
+To make the skill available globally instead, add the `-g` flag:
+
+```bash
+npx skills add arkan/icloud-cli -g
+```
+
+This installs the agent instructions from `SKILL.md`; it does not install the
+`icloud-cli` executable.
+
 ## Usage
 
 ```bash
